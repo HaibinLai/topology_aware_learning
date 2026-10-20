@@ -28,9 +28,13 @@ def get_parsl_config(
 
     # Get the number of nodes:
     node_file = os.getenv("PBS_NODEFILE")
-    with open(node_file, "r") as f:
-        node_list = f.readlines()
+    if node_file and os.path.exists(node_file):
+        with open(node_file, "r") as f:
+            node_list = f.readlines()
         num_nodes = len(node_list)
+    else:
+        # Local runs do not have a PBS node file.
+        num_nodes = 1
 
     user_opts = {
         "worker_init": f"module use /soft/modulefiles; module load conda; conda activate {env}; cd {src_dir}",  # load the environment where parsl is installed
@@ -92,16 +96,13 @@ def get_parsl_config(
             cpu_affinity="list:0-7,104-111:8-15,112-119:16-23,120-127:24-31,128-135:32-39,136-143:40-47,144-151:52-59,156-163:60-67,164-171:68-75,172-179:76-83,180-187:84-91,188-195:92-99,196-203",
         )
     if parsl_executor == "local":
-        executor = HighThroughputExecutor(
+        # A single worker deadlocks when a round waits on dependent client
+        # futures while Parsl's callback pool is scheduling the next tasks.
+        # Keep the executor local, but allow several client tasks to make
+        # progress concurrently.
+        executor = ThreadPoolExecutor(
             label="decentral_train",
-            heartbeat_period=15,
-            heartbeat_threshold=120,
-            worker_debug=True,
-            max_workers_per_node=4,
-            available_accelerators=4,
-            # available_accelerators=["0", "1", "2", "3"],
-            prefetch_capacity=0,
-            provider=local_provider,
+            max_threads=int(os.environ.get("TOPO_FL_LOCAL_THREADS", "8")),
         )
 
     if parsl_executor == "node":
@@ -225,11 +226,20 @@ export NUMEXPR_MAX_THREADS=208
             interchange_port_range=(45000, 46000),
         )
 
+    # Multiple experiment processes are often launched concurrently.  Parsl's
+    # default ``runinfo`` directory uses a shared numeric counter and can race
+    # when two processes select/create the same counter.  Give each process a
+    # unique run directory, with an environment override for batch systems.
+    parsl_run_dir = os.environ.get(
+        "TOPO_FL_PARSL_RUN_DIR",
+        f"/ssd/haibin/logs/topology_aware_learning/parsl_runinfo_{os.getpid()}",
+    )
     config = Config(
         executors=[executor, threadpool_executor],
         checkpoint_mode="task_exit",
         retries=2,
         app_cache=True,
+        run_dir=parsl_run_dir,
     )
 
     return config, num_accelerators

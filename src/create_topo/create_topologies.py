@@ -68,3 +68,26 @@ np.savetxt("topology/topo_7.txt", topology, fmt="%d")
 G = nx.barabasi_albert_graph(n=16, m=2, seed=0)
 topology = nx.to_numpy_array(G)
 np.savetxt("topology/topo_8.txt", topology, fmt="%d")
+
+seed = 0
+
+sizes = [11, 11, 11]
+self_conect = 0.5
+community_connect = 0.009
+probs = [
+        [self_conect, community_connect, community_connect],
+        [community_connect, self_conect, community_connect],
+        [
+            community_connect,
+            community_connect,
+            self_conect,
+        ],
+]
+g = nx.stochastic_block_model(sizes, probs, seed=seed)
+topology = nx.to_numpy_array(g)
+np.savetxt("topology/topo_sb_low_connect.txt", topology, fmt="%d")
+
+
+g = nx.barabasi_albert_graph(n=33, m=1, seed=seed)
+topology = nx.to_numpy_array(g)
+np.savetxt("topology/topo_ba33.txt", topology, fmt="%d")

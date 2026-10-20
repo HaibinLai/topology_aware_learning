@@ -175,6 +175,8 @@ if __name__ == "__main__":
             # "cluster",
             # "invCluster",
             "random",
+            "random_betCent",
+            "random_degCent",
         ],
         help="Type of aggregation stretegy used to among neighboring nodes.",
     )
@@ -191,6 +193,12 @@ if __name__ == "__main__":
         help="Path to output dir for all experiment log files/csvs",
     )
     parser.add_argument(
+        "--run_id",
+        type=str,
+        default="default",
+        help="Unique identifier for this experiment run; prevents checkpoint reuse.",
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default="../data",
@@ -203,7 +211,7 @@ if __name__ == "__main__":
         choices=[
             "polaris_experiment_per_node",
             "experiment_per_node",
-            # "local",
+            "local",
             # "aurora_local",
             # "node",
         ],
@@ -237,6 +245,13 @@ if __name__ == "__main__":
         help="Node index in network with backdoored data",
     )
     parser.add_argument(
+        "--backdoor_node_idxs",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Client indices receiving backdoor data; overrides --backdoor_node_idx.",
+    )
+    parser.add_argument(
         "--random_bd",
         action="store_true",
         help="By default flag is false and backdoor triggers will be applied to the top left of an image. If you set this flag, backdoor triggers will randomly be set anywhere within an image.",
@@ -244,7 +259,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--many_to_one",
         action="store_false",
-        help="By default flag is true and all backdoored images will be assigned label=0. If you set this flag, each new label = (old_label + 1)% # of total labels (aka many to many labels). ",
+        help="By default flag is true and all backdoored images will be assigned label=0. If you set this flag, each new label = (old_label + 1)%% # of total labels (aka many to many labels). ",
     )
     parser.add_argument(
         "--offset_clients_data_placement",
@@ -388,7 +403,7 @@ if __name__ == "__main__":
         import parsl
         from src.experiments.parsl_setup import get_parsl_config
 
-        config, num_accelerators = get_parsl_config("aurora_single_experiment")
+        config, num_accelerators = get_parsl_config(args.parsl_executor)
         parsl.load(config)
         ### Parsl set up
 
@@ -409,6 +424,7 @@ if __name__ == "__main__":
             participation=args.participation,
             seed=args.seed,
             log_dir=args.out_dir,
+            run_id=args.run_id,
             aggregation_strategy=args.aggregation_strategy,
             prox_coeff=args.prox_coeff,
             train_test_val=(
@@ -417,6 +433,7 @@ if __name__ == "__main__":
             backdoor=args.backdoor,
             backdoor_proportion=args.backdoor_proportion,
             backdoor_node_idx=args.backdoor_node_idx,
+            backdoor_node_idxs=args.backdoor_node_idxs,
             random_bd=args.random_bd,
             many_to_one=args.many_to_one,
             offset_clients_data_placement=args.offset_clients_data_placement,

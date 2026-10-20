@@ -1,4 +1,4 @@
-from concurrent.futures import as_completed
+from concurrent.futures import as_completed, TimeoutError
 import pathlib
 import torch
 import pandas as pd
@@ -62,6 +62,7 @@ def process_futures_and_ckpt(
     round_states: dict[int, dict[int, tuple[list[Result], DecentralClient]]],
     rounds: int,
     run_dir: pathlib.Path,
+    write_metrics: bool = False,
 ) -> None:
 
     # NOTE(MS): need to handle the case where rounds < ckpted rounds
@@ -74,7 +75,18 @@ def process_futures_and_ckpt(
         return
 
     ######### Process and Save training results
-    resolved_futures = [i.result() for i in as_completed(train_result_futures)]
+    resolved_futures = []
+    try:
+        completed = as_completed(train_result_futures, timeout=1800)
+        for future in completed:
+            try:
+                resolved_futures.append(future.result())
+            except Exception:
+                logging.exception("Parsl future failed while resolving training/aggregation result")
+                raise
+    except TimeoutError:
+        logging.exception("Timed out waiting for %d Parsl futures", len(train_result_futures))
+        raise
     [client_results.extend(i[0]) for i in resolved_futures]
     ckpt_clients = []
     for client_idx, client_future in round_states[rounds].items():
@@ -89,8 +101,13 @@ def process_futures_and_ckpt(
     checkpoint_path = f"{run_dir}/{rounds-1}_ckpt.pth"
     save_checkpoint(rounds - 1, ckpt_clients, client_results, checkpoint_path)
 
-    client_df = pd.DataFrame(client_results)
-    client_df.to_csv(f"{run_dir}/client_stats.csv")
+    # Keep metrics in the checkpoint/in-memory list during intermediate
+    # checkpoints.  CSV serialization is relatively expensive and needlessly
+    # rewrites the complete history every few rounds.  The final call writes
+    # the complete table once.
+    if write_metrics:
+        client_df = pd.DataFrame(client_results)
+        client_df.to_csv(f"{run_dir}/client_stats.csv", index=False)
 
     return
 

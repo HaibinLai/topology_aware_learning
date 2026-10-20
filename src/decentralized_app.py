@@ -13,6 +13,7 @@ import os
 import json
 import sys
 import shutil
+import hashlib
 
 from src.decentralized_client import create_clients
 from src.decentralized_client import create_centrality_dict
@@ -50,8 +51,14 @@ parsl_logger = logging.getLogger("parsl")
 parsl_logger.setLevel(logging.INFO)
 
 # Optionally set a file handler
-fh = logging.FileHandler("parsl_custom.log")
-fh.setLevel(logging.DEBUG)
+# Keep the high-volume Parsl log off the repository filesystem.  Callers can
+# override this for a run with TOPO_FL_PARSL_LOG.
+parsl_log_path = os.environ.get(
+    "TOPO_FL_PARSL_LOG", "/ssd/haibin/logs/topology_aware_learning/parsl_custom.log"
+)
+Path(parsl_log_path).parent.mkdir(parents=True, exist_ok=True)
+fh = logging.FileHandler(parsl_log_path)
+fh.setLevel(logging.INFO)
 parsl_logger.addHandler(fh)
 
 
@@ -110,12 +117,14 @@ class DecentrallearnApp:
         participation: float = 1.0,
         seed: int | None = 0,
         log_dir: str = "./logs",
+        run_id: str = "default",
         aggregation_strategy: str = "weighted",
         prox_coeff: float = 0.1,
         train_test_val: tuple[int] = None,
         backdoor: bool = False,
         backdoor_proportion: float = 0.1,
         backdoor_node_idx: int = 0,
+        backdoor_node_idxs: list[int] | None = None,
         random_bd: bool = False,
         # many-to-many or many-to-one backdoor from https://arxiv.org/pdf/1708.06733
         many_to_one: bool = True,
@@ -154,12 +163,17 @@ class DecentrallearnApp:
         args.pop("log_dir", None)
         args.pop("rounds", None)
         args.pop("checkpoint_every", None)
+        args["run_id"] = run_id
         arg_path = "_".join(map(str, list(args.values())))
 
         # Need to remove any . or / to ensure a single continuous file path
         arg_path = arg_path.replace(".", "")
         arg_path = arg_path.replace("/", "")
-        self.run_dir = Path(f"{log_dir}/{arg_path}/")
+        # Keep the full arguments in args.txt, but avoid exceeding the Linux
+        # NAME_MAX limit when the output root is on /ssd.
+        if len(arg_path) > 180:
+            arg_path = f"{run_id}_{hashlib.sha1(arg_path.encode()).hexdigest()[:12]}"
+        self.run_dir = Path(f"{log_dir}/{run_id}/{arg_path}/")
         # check if run_dir exists, if not, make it
         print(f"{self.run_dir}")
         if not os.path.exists(self.run_dir):
@@ -284,6 +298,9 @@ class DecentrallearnApp:
         self.backdoor = backdoor
         self.backdoor_proportion = backdoor_proportion
         self.backdoor_node_idx = backdoor_node_idx
+        self.backdoor_node_idxs = (
+            backdoor_node_idxs if backdoor_node_idxs is not None else [backdoor_node_idx]
+        )
         self.backdoor_test_data = None
         self.random_bd = random_bd
         self.many_to_one = many_to_one
@@ -331,6 +348,12 @@ class DecentrallearnApp:
         #    self.aggregation_function = centrality_module_avg
         if self.aggregation_strategy == "random":
             self.centrality_metric = "random"
+            self.aggregation_function = centrality_module_avg
+        if self.aggregation_strategy == "random_betCent":
+            self.centrality_metric = "random_betweenness"
+            self.aggregation_function = centrality_module_avg
+        if self.aggregation_strategy == "random_degCent":
+            self.centrality_metric = "random_degree"
             self.aggregation_function = centrality_module_avg
         # if self.aggregation_strategy == "invCluster":
         #    self.centrality_metric = "invCluster"
@@ -396,8 +419,8 @@ class DecentrallearnApp:
         self.label_alpha = label_alpha
         self.sample_alpha = sample_alpha
 
-        if backdoor_node_idx >= num_clients:
-            raise ValueError("Backdoor node index must be less than the # of clients.")
+        if any(idx < 0 or idx >= num_clients for idx in self.backdoor_node_idxs):
+            raise ValueError("Every backdoor node index must be a valid client index.")
 
         self.clients = create_clients(
             num_clients,
@@ -416,6 +439,7 @@ class DecentrallearnApp:
             self.backdoor,
             self.backdoor_proportion,
             self.backdoor_node_idx,
+            self.backdoor_node_idxs,
             self.random_bd,
             self.many_to_one,
             self.offset_clients_data_placement,
@@ -426,6 +450,14 @@ class DecentrallearnApp:
         )
 
         self.centrality_dict = create_centrality_dict(self.topology, self.rng)
+        self.centrality_dict["random_betweenness"] = {
+            i: 0.5 * (self.centrality_dict["random"][i] + self.centrality_dict["betweenness"][i])
+            for i in range(num_clients)
+        }
+        self.centrality_dict["random_degree"] = {
+            i: 0.5 * (self.centrality_dict["random"][i] + self.centrality_dict["degree"][i])
+            for i in range(num_clients)
+        }
         logger.log(APP_LOG_LEVEL, f"Created {len(self.clients)} clients")
 
         self.client_results: list[Result] = []
@@ -511,6 +543,7 @@ class DecentrallearnApp:
             self.round_states,
             self.rounds,
             self.run_dir,
+            write_metrics=True,
         )
 
         # NOTE(MS): how would we do parsl clean up?
@@ -555,8 +588,19 @@ class DecentrallearnApp:
         )
         futures = []
         self.round_states[round_idx + 1] = {}
+
+        def resolve(value):
+            """Materialize a Parsl future before building the next phase.
+
+            Passing futures from prior rounds into new apps creates a large,
+            deeply nested dependency graph.  Materializing at the round
+            boundary keeps the graph finite and makes failures local to the
+            round that submitted them.
+            """
+            return value.result() if hasattr(value, "result") else value
+
         for client in self.clients:
-            train_input = self.round_states[round_idx][client.idx]["agg"]
+            train_input = resolve(self.round_states[round_idx][client.idx]["agg"])
             # only use clients for round if they are selected
             if client.idx not in selected_client_idxs:
                 self.round_states[round_idx + 1][client.idx] = {"train": train_input}
@@ -564,7 +608,9 @@ class DecentrallearnApp:
             neighbor_idxs = client.get_neighbors()
             fed_prox_neighbors = []
             for i in neighbor_idxs:
-                fed_prox_neighbors.append(self.round_states[round_idx][i]["agg"])
+                fed_prox_neighbors.append(
+                    resolve(self.round_states[round_idx][i]["agg"])
+                )
 
             print(f"{client.idx=}")
             # print(f"{client.idx=}, {fed_prox_neighbors=}")
@@ -593,14 +639,29 @@ class DecentrallearnApp:
             preface = f"({round_idx+1}/{self.rounds}, client {client.idx}, )"
             logger.log(APP_LOG_LEVEL, f"{preface} Finished local training")
 
+        # Complete the training phase before submitting aggregation apps.
+        # This intentionally avoids passing current-round AppFutures into the
+        # next phase and prevents the cross-round dependency buildup that was
+        # stalling tasks 198/229/230.
+        for client_idx, state in self.round_states[round_idx + 1].items():
+            state["train"] = resolve(state["train"])
+
         # need to update random centrality metric before each round
-        if self.centrality_metric == "random":
+        if "random" in self.centrality_metric:
             self.centrality_dict = update_random_agg_coeffs(
                 seed=self.seed,
                 round_idx=round_idx,
                 num_clients=len(self.clients),
                 centrality_dict=self.centrality_dict,
             )
+            self.centrality_dict["random_betweenness"] = {
+                i: 0.5 * (self.centrality_dict["random"][i] + self.centrality_dict["betweenness"][i])
+                for i in range(len(self.clients))
+            }
+            self.centrality_dict["random_degree"] = {
+                i: 0.5 * (self.centrality_dict["random"][i] + self.centrality_dict["degree"][i])
+                for i in range(len(self.clients))
+            }
 
         for client in self.clients:
             agg_client = self.round_states[round_idx + 1][client.idx]["train"]

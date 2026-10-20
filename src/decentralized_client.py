@@ -27,6 +27,12 @@ from src.data import backdoor_data
 from parsl.app.app import python_app
 
 
+def _ensure_cpu(model: torch.nn.Module) -> None:
+    """Move a model only when it is currently on an accelerator."""
+    if any(parameter.is_cuda for parameter in model.parameters()):
+        model.to("cpu")
+
+
 class DecentralClient(BaseModel):
     """Client class."""
 
@@ -239,6 +245,7 @@ def create_clients(
     backdoor: bool,
     backdoor_proportion: float,
     backdoor_node_idx: int,
+    backdoor_node_idxs: list[int] | None = None,
     random_bd: bool = False,
     # many-to-many or many-to-one backdoor from https://arxiv.org/pdf/1708.06733
     many_to_one: bool = True,
@@ -312,36 +319,22 @@ def create_clients(
     )
 
     if backdoor:
-        rng_seed = rng.integers(low=0, high=4294967295, size=1).item()
-        stratify_targets = [label for x, label in train_subsets[backdoor_node_idx]]
-        clean_data, bd_data = backdoor_data(
-            data_name.value.lower(),
-            train_subsets[backdoor_node_idx],
-            stratify_targets,
-            backdoor_proportion,
-            rng_seed,
-            rng,
-            num_labels,
-            random_bd,
-            many_to_one,
-            # for propoer checkpointing purposes we need to save some additional info
-            offset_clients_data_placement,
-            centrality_metric_data_placement,
-            random_data_placement,
-            backdoor_node_idx,
-            num_clients=len(client_ids),
-            test_data=0,  # this is trianing data
-            trigger=trigger,
-        )
-        # combine clean + bd training data
-        concat_data = ConcatDataset([clean_data, bd_data])
-        clean_len = len(clean_data)
-        bd_len = len(bd_data)
-        new_indices = list(range(clean_len + bd_len))
-        # new_indices = list(range(len(stratify_targets)))
-        # wrap new bd-ed data in Subset class
-        train_subsets[backdoor_node_idx] = Subset(concat_data, new_indices)
-        print(f"backdoored client {backdoor_node_idx} data")
+        node_idxs = backdoor_node_idxs or [backdoor_node_idx]
+        for node_idx in node_idxs:
+            rng_seed = rng.integers(low=0, high=4294967295, size=1).item()
+            stratify_targets = [label for x, label in train_subsets[node_idx]]
+            clean_data, bd_data = backdoor_data(
+                data_name.value.lower(), train_subsets[node_idx], stratify_targets,
+                backdoor_proportion, rng_seed, rng, num_labels, random_bd,
+                many_to_one, offset_clients_data_placement,
+                centrality_metric_data_placement, random_data_placement, node_idx,
+                num_clients=len(client_ids), test_data=0, trigger=trigger,
+            )
+            concat_data = ConcatDataset([clean_data, bd_data])
+            train_subsets[node_idx] = Subset(
+                concat_data, list(range(len(clean_data) + len(bd_data)))
+            )
+            print(f"backdoored client {node_idx} data")
 
     clients = []
     for idx in client_ids:
@@ -401,7 +394,7 @@ def weighted_module_avg(
         for i in range(len(neighbor_futures)):
             client = neighbor_futures[i]
             model = client[1].model
-            model.to("cpu")
+            _ensure_cpu(model)
             w = weights[i]
             for name, value in model.state_dict().items():
                 partial = w * torch.clone(value)
@@ -434,7 +427,7 @@ def unweighted_module_avg(
         avg_weights = OrderedDict()
         for client in neighbor_futures:
             model = client[1].model
-            model.to("cpu")
+            _ensure_cpu(model)
             # model = client.result()[1].model
             for name, value in model.state_dict().items():
                 partial = w * torch.clone(value)
@@ -486,7 +479,7 @@ def sim_centrality_module_avg(
         if neighbor_idx == client_future[1].idx:
             # these are both the aggregating client: same model
             continue
-        neighbor_model.to("cpu")
+            _ensure_cpu(neighbor_model)
         neighborhood_sim[neighbor_idx] = cosine_similarity(client_model, neighbor_model)
 
     # convert the softmax to positive or negative
@@ -537,7 +530,7 @@ def sim_centrality_module_avg(
         for i in range(len(neighbor_futures)):
             client = neighbor_futures[i]
             model = client[1].model
-            model.to("cpu")
+            _ensure_cpu(model)
             w = weights[i]
             for name, value in model.state_dict().items():
                 partial = w * torch.clone(value)
@@ -599,7 +592,7 @@ def centrality_module_avg(
         for i in range(len(neighbor_futures)):
             client = neighbor_futures[i]
             model = client[1].model
-            model.to("cpu")
+            _ensure_cpu(model)
             w = weights[i]
             for name, value in model.state_dict().items():
                 partial = w * torch.clone(value)
@@ -633,7 +626,7 @@ def scale_agg(
             client_future,
         ]:
             model = client[1].model
-            model.to("cpu")
+            _ensure_cpu(model)
             # model = client.result()[1].model
             for name, value in model.state_dict().items():
                 partial = w * torch.clone(value)
