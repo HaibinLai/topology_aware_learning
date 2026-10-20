@@ -647,7 +647,10 @@ class DecentrallearnApp:
             state["train"] = resolve(state["train"])
 
         # need to update random centrality metric before each round
-        if "random" in self.centrality_metric:
+        # The combined random+centrality strategies are static: their random
+        # component is sampled once during initialization.  Only the pure
+        # random strategy refreshes its coefficients each round.
+        if self.centrality_metric == "random":
             self.centrality_dict = update_random_agg_coeffs(
                 seed=self.seed,
                 round_idx=round_idx,
