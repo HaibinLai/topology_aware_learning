@@ -24,7 +24,9 @@ def save_checkpoint(
 ):
     client_state_dicts = []
     for client in clients:
-        client_state_dicts.append(client.model.state_dict())
+        client_state_dicts.append(
+            {name: value.detach().cpu() for name, value in client.model.state_dict().items()}
+        )
 
     ckpt = {
         "client_state_dicts": client_state_dicts,

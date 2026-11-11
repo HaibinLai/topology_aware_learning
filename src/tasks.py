@@ -23,9 +23,29 @@ if intel_xpu_count > 0:
 
 
 NUM_DATA_WORKERS = 0
+_FAST_CLIENT_TENSORS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def _validate_classification_targets(targets: torch.Tensor, logits: torch.Tensor, *, client_idx: int, round_idx: int, batch_idx: int) -> None:
+def register_fast_client_tensors(
+    client: DecentralClient, inputs: torch.Tensor, targets: torch.Tensor
+) -> None:
+    """Cache deterministic image tensors for in-process client training."""
+    _FAST_CLIENT_TENSORS[id(client)] = (inputs, targets)
+
+
+def clear_fast_client_tensors() -> None:
+    _FAST_CLIENT_TENSORS.clear()
+
+
+def _validate_classification_targets(
+    targets: torch.Tensor,
+    logits: torch.Tensor,
+    *,
+    client_idx: int,
+    round_idx: int,
+    batch_idx: int,
+    source_target_range: tuple[int, int] | None = None,
+) -> None:
     """Fail on the CPU before CUDA cross entropy can trigger a device assert."""
     if targets.numel() == 0:
         raise ValueError(f"empty target batch client={client_idx} round={round_idx} batch={batch_idx}")
@@ -35,7 +55,8 @@ def _validate_classification_targets(targets: torch.Tensor, logits: torch.Tensor
     if target_min < 0 or target_max >= num_classes:
         raise ValueError(
             f"invalid target labels client={client_idx} round={round_idx} batch={batch_idx} "
-            f"min={target_min} max={target_max} num_classes={num_classes}"
+            f"min={target_min} max={target_max} num_classes={num_classes} "
+            f"source_cpu_range={source_target_range} device={targets.device}"
         )
 
 
@@ -47,6 +68,15 @@ def _loader_kwargs() -> dict:
         "pin_memory": pin_memory,
         "persistent_workers": NUM_DATA_WORKERS > 0,
     }
+
+
+def _move_batch_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # Non-blocking copies are only safe when the CPU source is pinned. This
+    # avoids asynchronous reads from short-lived pageable DataLoader batches.
+    return tensor.to(
+        device,
+        non_blocking=(device.type == "cuda" and tensor.device.type == "cpu" and tensor.is_pinned()),
+    )
 
 
 def accuracy(inputs, logits):
@@ -101,7 +131,6 @@ def no_local_train(
         else:
             device = torch.device(f"cuda:{client.idx % torch.cuda.device_count()}")
     results: list[Result] = []
-    print(f"TRAIN_START client={client.idx} round={round_idx} epochs={epochs}", flush=True)
     client.model.train()
     client.model = client.model.to(device)
     if optimizer == "sgd":
@@ -143,8 +172,13 @@ def no_local_train(
 
         for batch_idx, batch in enumerate(loader):
             inputs, targets = batch
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            source_target_range = (
+                (int(targets.min().item()), int(targets.max().item()))
+                if os.environ.get("TOPO_FL_VALIDATE_TARGET_TRANSFER", "0") == "1"
+                else None
+            )
+            inputs = _move_batch_tensor(inputs, device)
+            targets = _move_batch_tensor(targets, device)
             if "tiny_mem" in dataset_name:
                 model_output = client.model(inputs, labels=inputs)
                 loss = model_output.loss
@@ -154,7 +188,12 @@ def no_local_train(
             else:
                 preds = client.model(inputs)
                 _validate_classification_targets(
-                    targets, preds, client_idx=client.idx, round_idx=round_idx, batch_idx=batch_idx
+                    targets,
+                    preds,
+                    client_idx=client.idx,
+                    round_idx=round_idx,
+                    batch_idx=batch_idx,
+                    source_target_range=source_target_range,
                 )
                 loss = F.cross_entropy(preds, targets)
 
@@ -166,6 +205,13 @@ def no_local_train(
 
         end_time = time.time()
         avg_time_per_epoch += end_time - start_time
+
+        # The result table for final-only runs needs metrics from the final
+        # aggregated models, not from every local epoch/round.  Skip these
+        # repeated test-set passes; DecentrallearnApp schedules one evaluation
+        # after the last aggregation instead.
+        if os.environ.get("TOPO_FL_FINAL_EVAL_ONLY", "0") == "1":
+            continue
 
         # Test client on local test set TODO
 
@@ -221,8 +267,7 @@ def no_local_train(
     return results, client
 
 
-@python_app(executors=["decentral_train"])
-def local_train(
+def local_train_impl(
     future: tuple(list[Result], DecentralClient),
     round_idx: int,
     epochs: int,
@@ -253,17 +298,30 @@ def local_train(
     Returns:
         List of results that record the training history.
     """
-    # NOTE(MS): assign device once task has been fired off, rather than before via a function arg
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("xpu" if torch.xpu.is_available() else device)
+    client = future[1]
+    print(f"TRAIN_START client={client.idx} round={round_idx} epochs={epochs}", flush=True)
+    inprocess_execution = os.environ.get("TOPO_FL_INPROCESS", "0") == "1"
+    if inprocess_execution:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("xpu" if torch.xpu.is_available() else device)
     dataset_name = dataset.value.lower()
 
-    if seed is not None:
+    # The in-process path has no stochastic model layers or shuffled loaders.
+    # Avoid resetting PyTorch's process-global CPU/CUDA RNG concurrently from
+    # several client threads.
+    if seed is not None and not inprocess_execution:
         # torch.manual_seed will seed cuda GPUs
         torch.manual_seed(seed)
         torch.xpu.manual_seed(seed)
 
-    client = future[1]
+    if torch.cuda.is_available() and not inprocess_execution:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if visible and "," not in visible:
+            device = torch.device("cuda:0")
+        else:
+            device = torch.device(f"cuda:{client.idx % torch.cuda.device_count()}")
     results: list[Result] = []
     client.model.train()
     client.model = client.model.to(device)
@@ -285,7 +343,13 @@ def local_train(
             weight_decay=weight_decay,
             betas=(beta_1, beta_2),
         )
-    loader = DataLoader(client.train_data, batch_size=batch_size, **_loader_kwargs())
+    fast_tensors = _FAST_CLIENT_TENSORS.get(id(client)) if inprocess_execution else None
+    if fast_tensors is None:
+        loader = DataLoader(client.train_data, batch_size=batch_size, **_loader_kwargs())
+        num_batches = len(loader)
+    else:
+        loader = None
+        num_batches = (len(fast_tensors[1]) + batch_size - 1) // batch_size
 
     if prox_coeff > 0:
         for neighbor_future in neighbor_futures:
@@ -305,10 +369,25 @@ def local_train(
         if intel_xpu_count > 0:
             client.model, optimizer = ipex.optimize(client.model, optimizer=optimizer)
 
-        for batch_idx, batch in enumerate(loader):
+        if fast_tensors is None:
+            batches = enumerate(loader)
+        else:
+            cached_inputs, cached_targets = fast_tensors
+            batches = (
+                (
+                    batch_idx,
+                    (
+                        cached_inputs[batch_idx * batch_size : (batch_idx + 1) * batch_size],
+                        cached_targets[batch_idx * batch_size : (batch_idx + 1) * batch_size],
+                    ),
+                )
+                for batch_idx in range(num_batches)
+            )
+        for batch_idx, batch in batches:
             inputs, targets = batch
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            if fast_tensors is None:
+                inputs = _move_batch_tensor(inputs, device)
+                targets = _move_batch_tensor(targets, device)
             if "tiny_mem" in dataset_name:
                 model_output = client.model(inputs, labels=inputs)
                 loss = model_output.loss
@@ -317,9 +396,14 @@ def local_train(
 
             else:
                 preds = client.model(inputs)
-                _validate_classification_targets(
-                    targets, preds, client_idx=client.idx, round_idx=round_idx, batch_idx=batch_idx
-                )
+                if fast_tensors is None:
+                    _validate_classification_targets(
+                        targets,
+                        preds,
+                        client_idx=client.idx,
+                        round_idx=round_idx,
+                        batch_idx=batch_idx,
+                    )
                 loss = F.cross_entropy(preds, targets)
 
             running_loss += loss.detach()
@@ -342,6 +426,11 @@ def local_train(
 
         end_time = time.time()
         avg_time_per_epoch += end_time - start_time
+
+        # Final-only experiment runs evaluate the post-aggregation models once
+        # at the end; avoid repeating full global-test inference each epoch.
+        if os.environ.get("TOPO_FL_FINAL_EVAL_ONLY", "0") == "1":
+            continue
 
         # Test client on local test set TODO
 
@@ -382,9 +471,9 @@ def local_train(
                 "round_idx": round_idx,
                 "epoch": epoch,
                 "data_size": len(client.train_data),
-                "train_loss": (running_loss / len(loader)).item(),
-                "train_perp": (running_perp / len(loader)).item(),
-                "train_acc": (running_acc / len(loader)).item(),
+                "train_loss": (running_loss / num_batches).item(),
+                "train_perp": (running_perp / num_batches).item(),
+                "train_acc": (running_acc / num_batches).item(),
             }
             | global_test_result,
         )
@@ -392,9 +481,75 @@ def local_train(
         print(global_test_result)
         results.extend(epoch_results)
 
-    # need to send model back to cpu since all coordination is happening from a non-gpu node
-    client.model.to("cpu")
+    # The in-process execution path keeps client weights resident on the GPU
+    # across rounds, avoiding a GPU->CPU->GPU transfer for every client.
+    if os.environ.get("TOPO_FL_INPROCESS", "0") != "1":
+        client.model.to("cpu")
     return results, client
+
+
+local_train = python_app(executors=["decentral_train"])(local_train_impl)
+
+
+def evaluate_final_client_impl(
+    client_future: tuple(list[Result], DecentralClient),
+    round_idx: int,
+    batch_size: int,
+    seed: int,
+    dataset: DataChoices,
+    backdoor: bool = False,
+    evaluate_noisy: bool = False,
+) -> tuple(list[Result], DecentralClient):
+    """Evaluate a client's model after the final round aggregation."""
+    client = client_future[1]
+    result = test_model(
+        client.model,
+        client.global_test_data,
+        round_idx,
+        batch_size,
+        seed,
+        dataset,
+    )
+    if backdoor:
+        backdoor_result = test_model(
+            client.model,
+            client.global_backdoor_test_data,
+            round_idx,
+            batch_size,
+            seed,
+            dataset,
+        )
+        result.update(
+            {
+                "backdoor_acc": backdoor_result["test_acc"],
+                "backdoor_loss": backdoor_result["test_loss"],
+                "backdoor_auc_macro": backdoor_result["clean_auc_macro"],
+                "backdoor_auc_weighted": backdoor_result["clean_auc_weighted"],
+            }
+        )
+    if evaluate_noisy and client.global_noisy_test_data is not None:
+        noisy_result = test_model(
+            client.model, client.global_noisy_test_data, round_idx, batch_size, seed, dataset
+        )
+        result.update({
+            "ood_acc": noisy_result["test_acc"],
+            "ood_auc_macro": noisy_result["clean_auc_macro"],
+        })
+    result.update(
+        {
+            "client_idx": client.idx,
+            "round_idx": round_idx,
+            "epoch": 0,
+            "data_size": len(client.train_data),
+            "is_final_evaluation": True,
+        }
+    )
+    client.model.to("cpu")
+    print(f"FINAL_EVAL_DONE client={client.idx} round={round_idx}", flush=True)
+    return [result], client
+
+
+evaluate_final_client = python_app(executors=["decentral_train"])(evaluate_final_client_impl)
 
 
 def test_model(

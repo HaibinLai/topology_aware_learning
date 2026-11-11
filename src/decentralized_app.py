@@ -4,16 +4,18 @@ import logging
 import pathlib
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
 import numpy
 import torch
+from torch.utils.data import Subset
 import glob
 import os
 import json
 import sys
 import shutil
 import hashlib
+import time
 
 from src.decentralized_client import create_clients
 from src.decentralized_client import create_centrality_dict
@@ -26,10 +28,16 @@ from src.decentralized_client import scale_agg
 from src.decentralized_client import update_random_agg_coeffs
 from src.modules import create_model
 from src.data import backdoor_data
+from src.data import GaussianNoiseDataset, MixedGaussianNoiseDataset
 from src.modules import load_data
 from src.utils import load_checkpoint
 from src.tasks import local_train
+from src.tasks import local_train_impl
 from src.tasks import no_local_train
+from src.tasks import evaluate_final_client
+from src.tasks import evaluate_final_client_impl
+from src.tasks import register_fast_client_tensors
+from src.tasks import clear_fast_client_tensors
 from src.tasks import test_model
 from src.types import DataChoices
 from src.types import Result
@@ -154,8 +162,12 @@ class DecentrallearnApp:
         task_type: str = "multiply",  # TinyMem Task type: multiply | sum
         data_dis: str = "evens",  # Tiny mem data dir: primes | evens
         checkpoint_every: int = 5,  # checkpoint every X rounds
+        noise_node_idxs: list[int] | None = None,
+        noise_std: float = 0.1,
+        noise_mix_ratio: float = 0.1,
     ) -> None:
 
+        self.inprocess_execution = os.environ.get("TOPO_FL_INPROCESS", "0") == "1"
         # make the outdir
         args = locals()
         args["topology_path"] = os.path.basename(args["topology_path"])
@@ -164,6 +176,8 @@ class DecentrallearnApp:
         args.pop("rounds", None)
         args.pop("checkpoint_every", None)
         args["run_id"] = run_id
+        args["final_eval_only"] = os.environ.get("TOPO_FL_FINAL_EVAL_ONLY", "0") == "1"
+        args["inprocess_execution"] = self.inprocess_execution
         arg_path = "_".join(map(str, list(args.values())))
 
         # Need to remove any . or / to ensure a single continuous file path
@@ -180,6 +194,7 @@ class DecentrallearnApp:
             os.makedirs(self.run_dir)
 
         # Save args in the run_dir
+        args["gpu_tensor_cache"] = self.inprocess_execution and dataset in {"fmnist", "mnist"}
         json.dump(args, open(f"{self.run_dir}/args.txt", "w"))
 
         if dataset == "mnist":
@@ -290,6 +305,15 @@ class DecentrallearnApp:
             task_type=task_type,
             data_dis=data_dis,  # Tiny mem data distribution: primes | evens
             length=length,
+        )
+        self.noise_node_idxs = list(noise_node_idxs or [])
+        self.noise_std = float(noise_std)
+        self.noise_mix_ratio = float(noise_mix_ratio)
+        if self.noise_node_idxs and not (0.0 <= self.noise_mix_ratio <= 1.0):
+            raise ValueError("noise_mix_ratio must be in [0, 1].")
+        self.noisy_test_data = (
+            GaussianNoiseDataset(self.test_data, noise_std=self.noise_std, seed=seed or 1)
+            if self.noise_node_idxs else None
         )
 
         self.topology = numpy.loadtxt(topology_path, dtype=float)
@@ -403,6 +427,14 @@ class DecentrallearnApp:
         self.weight_decay = weight_decay
         self.beta_1 = beta_1
         self.beta_2 = beta_2
+        self.local_executor = (
+            ThreadPoolExecutor(
+                max_workers=max(1, int(os.environ.get("TOPO_FL_LOCAL_THREADS", "8"))),
+                thread_name_prefix="client-train",
+            )
+            if self.inprocess_execution
+            else None
+        )
 
         self.prox_coeff = prox_coeff
         self.participation = participation
@@ -447,6 +479,10 @@ class DecentrallearnApp:
             self.random_data_placement,
             self.run_dir,
             self.trigger,
+            self.noise_node_idxs,
+            self.noise_std,
+            self.noise_mix_ratio,
+            self.noisy_test_data,
         )
 
         self.centrality_dict = create_centrality_dict(self.topology, self.rng)
@@ -485,9 +521,117 @@ class DecentrallearnApp:
             self.start_round += 1  # we save the ckpt after the last round, so we add 1 to start the next round
             print(f"loaded latest ckpt from: {checkpoint_path}")
 
+        self._prepare_inprocess_dataset_cache()
+
     def close(self) -> None:
         """Close the application."""
-        pass
+        if self.local_executor is not None:
+            self.local_executor.shutdown(wait=True)
+            self.local_executor = None
+        if self.inprocess_execution:
+            clear_fast_client_tensors()
+
+    def _prepare_inprocess_dataset_cache(self) -> None:
+        """Materialize deterministic MNIST-family tensors once on the GPU."""
+        if not self.inprocess_execution or self.dataset not in {
+            DataChoices.FMNIST,
+            DataChoices.MNIST,
+        }:
+            return
+        base = self.train_data
+        if not all(hasattr(base, name) for name in ("data", "targets", "transform")):
+            return
+        # The MNIST and FashionMNIST loaders use only ToTensor(). Leave other
+        # transforms on the original DataLoader path to preserve semantics.
+        if type(base.transform).__name__ != "ToTensor":
+            return
+
+        def flatten_subset(dataset):
+            if isinstance(dataset, Subset):
+                parent_indices, parent = flatten_subset(dataset.dataset)
+                return parent_indices[numpy.asarray(dataset.indices, dtype=numpy.int64)], parent
+            return numpy.arange(len(dataset), dtype=numpy.int64), dataset
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        raw_images = base.data
+        raw_targets = base.targets
+        target_min, target_max = int(raw_targets.min().item()), int(raw_targets.max().item())
+        if target_min < 0 or target_max >= self.num_labels:
+            raise ValueError(
+                f"invalid source labels before GPU cache: min={target_min} max={target_max} "
+                f"num_classes={self.num_labels}"
+            )
+        images = raw_images.unsqueeze(1).to(device=device, dtype=torch.float32).div_(255.0)
+        targets = raw_targets.to(device=device, dtype=torch.long)
+        cached_samples = 0
+        for client in self.clients:
+            indices, client_base = flatten_subset(client.train_data)
+            if client_base is not base:
+                continue
+            index_tensor = torch.as_tensor(indices, dtype=torch.long, device=device)
+            client_images = images.index_select(0, index_tensor).contiguous()
+            client_targets = targets.index_select(0, index_tensor).contiguous()
+            register_fast_client_tensors(client, client_images, client_targets)
+            cached_samples += len(indices)
+        logger.log(
+            APP_LOG_LEVEL,
+            "INPROCESS_DATA_CACHE clients=%d samples=%d device=%s",
+            len(self.clients),
+            cached_samples,
+            device,
+        )
+
+    @staticmethod
+    def _completed_future(value):
+        future = Future()
+        future.set_result(value)
+        return future
+
+    def _aggregate_from_snapshots(self, client, neighbor_idxs, snapshot_states, softmax_coeff):
+        """Aggregate immutable round snapshots on the model's current device."""
+        strategy = self.aggregation_strategy
+        if strategy in {"weighted", "unweighted", "unweighted_fl"}:
+            if strategy == "weighted":
+                raw_weights = [len(self.clients[i].train_data) for i in neighbor_idxs]
+            else:
+                raw_weights = [1.0] * len(neighbor_idxs)
+            denominator = float(sum(raw_weights))
+            weights = [float(w) / denominator for w in raw_weights]
+        elif strategy in {"random", "random_betCent", "random_degCent", "betCent", "degCent"}:
+            raw_weights = [
+                self.centrality_dict[self.centrality_metric][i] for i in neighbor_idxs
+            ]
+            if self.softmax:
+                scaled = numpy.asarray(raw_weights, dtype=float) * softmax_coeff
+                exp_weights = numpy.exp(scaled - numpy.max(scaled))
+                weights = (exp_weights / exp_weights.sum()).tolist()
+            else:
+                denominator = float(sum(raw_weights))
+                weights = [float(w) / denominator for w in raw_weights]
+        else:
+            raise ValueError(f"in-process aggregation does not support {strategy!r}")
+
+        state_dict = client.model.state_dict()
+        with torch.no_grad():
+            for name, target in state_dict.items():
+                source = snapshot_states[neighbor_idxs[0]][name]
+                value = source * weights[0]
+                for idx, weight in zip(neighbor_idxs[1:], weights[1:]):
+                    value.add_(snapshot_states[idx][name].to(value.dtype), alpha=weight)
+                target.copy_(value)
+        client.model.load_state_dict(state_dict)
+
+    def _snapshot_model_states(self, train_states):
+        """Clone each post-training state once so parallel aggregations never race."""
+        snapshots = {}
+        for client_idx, state in train_states.items():
+            model = state["train"][1].model
+            if torch.cuda.is_available():
+                model.to(torch.device("cuda:0"))
+            snapshots[client_idx] = {
+                name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+            }
+        return snapshots
 
     def run(
         self,
@@ -508,6 +652,8 @@ class DecentrallearnApp:
         round_idx = self.start_round
         self.round_states[self.start_round] = {}
         for client_idx in range(len(self.clients)):
+            if self.inprocess_execution and torch.cuda.is_available():
+                self.clients[client_idx].model.to(torch.device("cuda:0"))
             self.round_states[self.start_round][client_idx] = {
                 "agg": ([{}], self.clients[client_idx])
             }
@@ -536,6 +682,38 @@ class DecentrallearnApp:
             old_round = round_idx - 1
             if old_round in self.round_states:
                 del self.round_states[round_idx - 1]
+
+        if os.environ.get("TOPO_FL_FINAL_EVAL_ONLY", "0") == "1":
+            logger.log(
+                APP_LOG_LEVEL,
+                "Scheduling final evaluation on each client's post-aggregation model",
+            )
+            for client_idx in range(len(self.clients)):
+                final_agg = self.round_states[self.rounds][client_idx]["agg"]
+                evaluator = evaluate_final_client
+                if self.inprocess_execution:
+                    evaluator = self.local_executor.submit
+                    final_future = evaluator(
+                        evaluate_final_client_impl,
+                        final_agg,
+                        self.rounds - 1,
+                        self.batch_size,
+                        self.seed,
+                        self.dataset,
+                        self.backdoor,
+                        bool(self.noise_node_idxs),
+                    )
+                else:
+                    final_future = evaluator(
+                        final_agg,
+                        self.rounds - 1,
+                        self.batch_size,
+                        self.seed,
+                        self.dataset,
+                        self.backdoor,
+                        bool(self.noise_node_idxs),
+                    )
+                train_result_futures.append(final_future)
 
         process_futures_and_ckpt(
             self.client_results,
@@ -569,6 +747,7 @@ class DecentrallearnApp:
             List of results from each client.
         """
         print("round idx: ", round_idx)
+        round_started = time.perf_counter()
         job = local_train if self.train else no_local_train
 
         # select client indexes
@@ -588,6 +767,7 @@ class DecentrallearnApp:
         )
         futures = []
         self.round_states[round_idx + 1] = {}
+        dispatch_started = time.perf_counter()
 
         def resolve(value):
             """Materialize a Parsl future before building the next phase.
@@ -615,7 +795,7 @@ class DecentrallearnApp:
             print(f"{client.idx=}")
             # print(f"{client.idx=}, {fed_prox_neighbors=}")
             # print(f"{self.dataset=}")
-            future = job(
+            train_args = (
                 train_input,
                 round_idx,
                 self.epochs,
@@ -623,7 +803,6 @@ class DecentrallearnApp:
                 self.lr,
                 self.momentum,
                 self.prox_coeff,
-                # self.device,
                 self.seed,
                 self.backdoor,
                 self.dataset,
@@ -633,18 +812,25 @@ class DecentrallearnApp:
                 self.beta_2,
                 *fed_prox_neighbors,
             )
+            if self.inprocess_execution and self.train:
+                future = self.local_executor.submit(local_train_impl, *train_args)
+            else:
+                future = job(*train_args)
             print(f"Launched Future: {future=}")
             self.round_states[round_idx + 1][client.idx] = {"train": future}
 
             preface = f"({round_idx+1}/{self.rounds}, client {client.idx}, )"
-            logger.log(APP_LOG_LEVEL, f"{preface} Finished local training")
+            logger.log(APP_LOG_LEVEL, f"{preface} Submitted local training task")
 
         # Complete the training phase before submitting aggregation apps.
         # This intentionally avoids passing current-round AppFutures into the
         # next phase and prevents the cross-round dependency buildup that was
         # stalling tasks 198/229/230.
+        dispatch_seconds = time.perf_counter() - dispatch_started
+        train_wait_started = time.perf_counter()
         for client_idx, state in self.round_states[round_idx + 1].items():
             state["train"] = resolve(state["train"])
+        train_wait_seconds = time.perf_counter() - train_wait_started
 
         # need to update random centrality metric before each round
         # Refresh the random component for pure random and both combined
@@ -665,22 +851,36 @@ class DecentrallearnApp:
                 for i in range(len(self.clients))
             }
 
+        snapshot_started = time.perf_counter()
+        fast_aggregation = self.inprocess_execution and self.aggregation_strategy in {
+            "weighted", "unweighted", "unweighted_fl", "random", "random_betCent",
+            "random_degCent", "betCent", "degCent",
+        }
+        snapshot_states = (
+            self._snapshot_model_states(self.round_states[round_idx + 1])
+            if fast_aggregation
+            else None
+        )
+        snapshot_seconds = time.perf_counter() - snapshot_started
+        aggregate_started = time.perf_counter()
+
         for client in self.clients:
             agg_client = self.round_states[round_idx + 1][client.idx]["train"]
 
             # only use clients for round if they are selected
             if client.idx not in selected_client_idxs:
                 self.round_states[round_idx + 1][client.idx].update({"agg": agg_client})
-                # pass in client futures even if they are not being aggregated
-                # NOTE(MS): not sure if it makes sense to append futures in the event of a dropped client for a specific round?
-                futures.append(agg_client)
+                futures.append(
+                    self._completed_future(agg_client) if fast_aggregation else agg_client
+                )
                 continue
 
             neighbor_idxs = client.get_neighbors()
             if len(neighbor_idxs) == 0:
                 self.round_states[round_idx + 1][client.idx].update({"agg": agg_client})
-                # pass in client futures even if they are not being aggregated
-                futures.append(agg_client)
+                futures.append(
+                    self._completed_future(agg_client) if fast_aggregation else agg_client
+                )
                 continue
 
             # need to combine neighbors w/ client and pass to aggregate function
@@ -690,6 +890,16 @@ class DecentrallearnApp:
             for i in neighbor_idxs:
                 # NOTE (MS): we want to grab neighbors from the PRIOR round (as the current round still requires finishing)
                 agg_neighbors.append(self.round_states[round_idx + 1][i]["train"])
+            if fast_aggregation:
+                self._aggregate_from_snapshots(
+                    client,
+                    neighbor_idxs,
+                    snapshot_states,
+                    self.aggregation_scheduler.get_softmax_coeff(),
+                )
+                self.round_states[round_idx + 1][client.idx].update({"agg": agg_client})
+                futures.append(self._completed_future(agg_client))
+                continue
             future = self.aggregation_function(
                 agg_client,
                 self.seed,
@@ -703,5 +913,17 @@ class DecentrallearnApp:
             futures.append(future)
             self.round_states[round_idx + 1][client.idx].update({"agg": future})
         self.aggregation_scheduler.step(round_idx)
+        aggregate_seconds = time.perf_counter() - aggregate_started
+        logger.log(
+            APP_LOG_LEVEL,
+            "PERF round=%d dispatch_and_input_wait_sec=%.3f train_barrier_sec=%.3f "
+            "snapshot_sec=%.3f aggregate_sec=%.3f round_total_sec=%.3f",
+            round_idx + 1,
+            dispatch_seconds,
+            train_wait_seconds,
+            snapshot_seconds,
+            aggregate_seconds,
+            time.perf_counter() - round_started,
+        )
 
         return futures  # results
