@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
 import torch
 import os
+import hashlib
 
 from src.modules import load_data
 from src.modules import CustomLMDataset
@@ -24,6 +25,59 @@ T = t.TypeVar("T")
 Generic type variable used throughout Flight.
 """
 FloatTriple: t.TypeAlias = tuple[float, float, float]
+
+
+class GaussianNoiseDataset(Dataset):
+    """Deterministic, label-preserving Gaussian corruption for CIFAR-10 tensors.
+
+    CIFAR-10 tensors in this project are normalized with mean/std 0.5. Noise is
+    sampled on the original [0, 1] pixel scale, clipped, and normalized again.
+    """
+
+    def __init__(self, dataset: Dataset, indices: list[int] | None = None,
+                 noise_std: float = 0.1, seed: int = 1):
+        self.dataset = dataset
+        self.indices = list(range(len(dataset))) if indices is None else list(indices)
+        self.noise_std = float(noise_std)
+        self.seed = int(seed)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        import torch
+        x, y = self.dataset[self.indices[index]]
+        # Stable per-example noise: repeated epochs see the same corrupted image.
+        digest = hashlib.blake2b(f"{self.seed}:{self.indices[index]}".encode(), digest_size=8).digest()
+        generator = torch.Generator().manual_seed(int.from_bytes(digest, "little") % (2**63 - 1))
+        raw = ((x + 1.0) * 0.5).clamp(0.0, 1.0)
+        raw = (raw + torch.randn(raw.shape, generator=generator, dtype=raw.dtype) * self.noise_std).clamp(0.0, 1.0)
+        return (raw - 0.5) / 0.5, y
+
+
+class MixedGaussianNoiseDataset(Dataset):
+    """Apply fixed-seed input noise to a selected fraction of a local subset."""
+
+    def __init__(self, dataset: Dataset, ratio: float, noise_std: float, seed: int):
+        self.dataset = dataset
+        n_noisy = int(round(len(dataset) * ratio))
+        rng = np.random.default_rng(seed)
+        self.noisy_indices = set(rng.permutation(len(dataset))[:n_noisy].tolist())
+        self.noise_std = noise_std
+        self.seed = seed
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        x, y = self.dataset[index]
+        if index in self.noisy_indices:
+            import torch
+            generator = torch.Generator().manual_seed((self.seed * 1000003 + index) % (2**63 - 1))
+            raw = ((x + 1.0) * 0.5).clamp(0.0, 1.0)
+            raw = (raw + torch.randn(raw.shape, generator=generator, dtype=raw.dtype) * self.noise_std).clamp(0.0, 1.0)
+            x = (raw - 0.5) / 0.5
+        return x, y
 
 
 def proportion_split(

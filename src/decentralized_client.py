@@ -23,6 +23,7 @@ from src.types import DataChoices
 from src.data import federated_split
 from src.data import random_generator
 from src.data import backdoor_data
+from src.data import MixedGaussianNoiseDataset
 
 from parsl.app.app import python_app
 
@@ -56,6 +57,7 @@ class DecentralClient(BaseModel):
     global_backdoor_test_data: Optional[Subset] = Field(  # noqa: UP007
         description="Subset of global test data that has been backdoored (for testing ASR).",
     )
+    global_noisy_test_data: Optional[Dataset] = None
     neighbors: list[int] = Field(description="list of this clients neighbors")
     neighbor_probs: list[float] = Field(
         description="list of this clients neighbors' network connection probabilities (for modeling faulty networks)"
@@ -254,6 +256,10 @@ def create_clients(
     random_data_placement: bool = True,
     ckpt_dir: str = "./ckpt",
     trigger: int = 100,
+    noise_node_idxs: list[int] | None = None,
+    noise_std: float = 0.1,
+    noise_mix_ratio: float = 0.1,
+    noisy_test_data: Dataset | None = None,
 ) -> list[DecentralClient]:
     """Create many clients with disjoint sets of data.
 
@@ -299,6 +305,14 @@ def create_clients(
 
     centrality_dict = create_centrality_dict(topology, rng=rng)
     train_subsets = {idx: Subset(train_data, train_indices[idx]) for idx in client_ids}
+    noise_node_idxs = noise_node_idxs or []
+    for node_idx in noise_node_idxs:
+        if node_idx < 0 or node_idx >= num_clients:
+            raise ValueError(f"Invalid noise source client index: {node_idx}")
+        train_subsets[node_idx] = MixedGaussianNoiseDataset(
+            train_subsets[node_idx], noise_mix_ratio, noise_std,
+            node_idx + 1,
+        )
     label_counts_per_worker = get_label_counts(
         num_clients=len(client_ids),
         num_labels=num_labels,
@@ -354,6 +368,7 @@ def create_clients(
             neighbor_probs=probs,
             prox_coeff=prox_coeff,
             global_backdoor_test_data=backdoor_test_data,
+            global_noisy_test_data=noisy_test_data,
             # centrality_dict=centrality_dict,
         )
         clients.append(client)

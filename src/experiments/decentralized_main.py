@@ -232,6 +232,12 @@ if __name__ == "__main__":
         action="store_true",
         help="By default flag is false and no backdoor will be set. If you set this flag, backdoor training will be performed..",
     )
+    parser.add_argument("--noise_node_idxs", type=int, nargs="+", default=None,
+                        help="Client IDs receiving label-preserving Gaussian input noise.")
+    parser.add_argument("--noise_std", type=float, default=0.1,
+                        help="Gaussian noise standard deviation on CIFAR-10 [0,1] pixels.")
+    parser.add_argument("--noise_mix_ratio", type=float, default=0.1,
+                        help="Fraction of each selected client's training samples corrupted.")
     parser.add_argument(
         "--backdoor_proportion",
         type=float,
@@ -403,8 +409,10 @@ if __name__ == "__main__":
         import parsl
         from src.experiments.parsl_setup import get_parsl_config
 
-        config, num_accelerators = get_parsl_config(args.parsl_executor)
-        parsl.load(config)
+        inprocess_execution = os.environ.get("TOPO_FL_INPROCESS", "0") == "1"
+        if not inprocess_execution:
+            config, num_accelerators = get_parsl_config(args.parsl_executor)
+            parsl.load(config)
         ### Parsl set up
 
         decentral_app = DecentrallearnApp(
@@ -453,6 +461,9 @@ if __name__ == "__main__":
             T_mult=args.T_mult,
             eta_min=args.eta_min,
             trigger=args.trigger,  # trigger for TinyMem BD
+            noise_node_idxs=args.noise_node_idxs,
+            noise_std=args.noise_std,
+            noise_mix_ratio=args.noise_mix_ratio,
             num_test=args.num_test,  # TinyMem number of test data per task
             num_example=args.num_example,  # TinyMem total number of data per task (train + test)
             modulo=args.modulo,  # TinyMem modulo applied to each # in seq
@@ -465,7 +476,8 @@ if __name__ == "__main__":
         )
         # client_results = decentral_app.run()
         exit_value = decentral_app.run()
-        parsl.dfk().cleanup()
+        if not inprocess_execution:
+            parsl.dfk().cleanup()
         decentral_app.close()
         return exit_value
 
