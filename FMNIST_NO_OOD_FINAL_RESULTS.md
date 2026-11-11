@@ -45,6 +45,40 @@ Updated: 2026-11-11
 | BA m=3 | 1000 | random_betCent | 0.8748 | 0.9866 | 0.9866 |
 | BA m=3 | 1000 | random_degCent | 0.8753 | 0.9867 | 0.9867 |
 
+## Aggregate summary
+
+All summaries below are computed from the 30 selected final run CSVs. First, each run is averaged over its 33 clients at `round_idx=39` and final evaluation; the tables then average those 30 configuration means equally. Thus these are descriptive averages across this seed-1 experiment matrix, not averages across multiple seeds.
+
+### Mean by aggregation method
+
+Each method averages its six configurations (2 graphs × 3 `label_alpha` values).
+
+| Aggregation | Mean Clean Acc | Mean Clean AUC (macro) | Mean Clean AUC (weighted) |
+|---|---:|---:|---:|
+| random | 0.8574 | 0.9840 | 0.9840 |
+| random_betCent | 0.8582 | 0.9841 | 0.9841 |
+| random_degCent | 0.8566 | 0.9839 | 0.9839 |
+| betCent | 0.8538 | 0.9830 | 0.9830 |
+| degCent | 0.8532 | 0.9830 | 0.9830 |
+
+### Distribution across the 30 configuration means
+
+| Metric | Mean | Median | Min | Max |
+|---|---:|---:|---:|---:|
+| Clean Acc | 0.8558 | 0.8550 | 0.8192 | 0.8758 |
+| Clean AUC (macro) | 0.9836 | 0.9837 | 0.9770 | 0.9868 |
+| Clean AUC (weighted) | 0.9836 | 0.9837 | 0.9770 | 0.9868 |
+
+### Mean by graph and label alpha
+
+| Group | Mean Clean Acc | Mean Clean AUC (macro) |
+|---|---:|---:|
+| BA m=1 (15 configs) | 0.8430 | 0.9813 |
+| BA m=3 (15 configs) | 0.8686 | 0.9859 |
+| `label_alpha=1` (10 configs) | 0.8433 | 0.9818 |
+| `label_alpha=10` (10 configs) | 0.8619 | 0.9845 |
+| `label_alpha=1000` (10 configs) | 0.8623 | 0.9845 |
+
 ## Quick read
 
 - Best Clean Acc: 0.8758 — BA m=3, `label_alpha=1000`, `random`.
@@ -53,6 +87,7 @@ Updated: 2026-11-11
 
 ## Files
 
-- Raw per-client final records: each run’s `client_stats.csv` under `results/<run_id>/<args_hash>/`.
+- Consolidated per-client final metrics (990 rows across 30 configurations): `FMNIST_NO_OOD_PER_CLIENT_FINAL.csv`.
+- Original per-run records: each run’s `client_stats.csv` under `results/<run_id>/<args_hash>/`.
 - Launch/finish queue: `queue_gpucache_resume.log`.
 - Performance optimization record: `optimization_records/2026-11-11_runtime_optimization.md` and its PNG chart.
