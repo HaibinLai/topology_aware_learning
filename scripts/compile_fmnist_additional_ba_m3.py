@@ -68,8 +68,32 @@ def expected_runs() -> set[tuple[str, int, str]]:
 
 
 def identify(args: dict) -> tuple[str, int, str]:
+    if args.get("ood_type") not in (None, "noise"):
+        raise RuntimeError(f"Unexpected OOD type: {args.get('ood_type')}")
     condition = "noise-4-node" if args.get("ood_type") == "noise" else "no-OOD"
     return condition, int(args["label_alpha"]), args["aggregation_strategy"]
+
+
+def validate_common_args(args: dict, run_id: str) -> None:
+    expected = {
+        "dataset": "fmnist",
+        "topology_path": "topo_ba33_m3.txt",
+        "batch_size": 16,
+        "epochs": 5,
+        "lr": 0.0001,
+        "sample_alpha": 1000.0,
+        "seed": 1,
+        "optimizer": "adam",
+        "final_eval_only": True,
+        "inprocess_execution": True,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": args.get(key)}
+        for key, value in expected.items()
+        if args.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"{run_id}: argument mismatch: {mismatches}")
 
 
 def load_runs(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -87,15 +111,18 @@ def load_runs(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         observed.add(key)
         condition, alpha, method = key
         run_id = args["run_id"]
+        validate_common_args(args, run_id)
 
         frame = pd.read_csv(csv_path)
         final = frame[
             frame["is_final_evaluation"].fillna(False).astype(bool)
             & (frame["round_idx"] == 39)
         ].copy()
-        if len(final) != 33 or final["client_idx"].nunique() != 33:
+        client_ids = set(final["client_idx"].astype(int))
+        if len(final) != 33 or client_ids != set(range(33)):
             raise RuntimeError(
-                f"{run_id}: expected 33 unique final clients, found {len(final)}"
+                f"{run_id}: expected final clients 0..32, found "
+                f"{len(final)} rows and IDs {sorted(client_ids)}"
             )
         if condition == "noise-4-node":
             required = set(FINAL_METRICS)
