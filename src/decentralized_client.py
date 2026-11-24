@@ -23,7 +23,7 @@ from src.types import DataChoices
 from src.data import federated_split
 from src.data import random_generator
 from src.data import backdoor_data
-from src.data import MixedGaussianNoiseDataset
+from src.data import CorruptedDataset, MixedGaussianNoiseDataset
 
 from parsl.app.app import python_app
 
@@ -42,7 +42,7 @@ class DecentralClient(BaseModel):
     idx: int = Field(description="Client ID.")
     prox_coeff: float = Field(description="Proximal term coefficient (FedProx).")
     model: torch.nn.Module = Field(description="Client local model.")
-    train_data: Optional[Subset] = Field(  # noqa: UP007
+    train_data: Optional[Dataset] = Field(  # noqa: UP007
         description="Subset of data this client will train on.",
     )
     test_data: Optional[Subset] = Field(  # noqa: UP007
@@ -189,6 +189,46 @@ def update_random_agg_coeffs(
     return centrality_dict
 
 
+def compute_metropolis_hastings_weights(topology: np.ndarray) -> np.ndarray:
+    """Build the symmetric doubly-stochastic matrix used by ``mhCent``.
+
+    This follows the upstream ``aurora`` implementation: add a self-loop
+    before computing degrees, assign every graph edge
+    ``1 / max(d_i, d_j)``, and put the remaining mass on the diagonal.
+    """
+    adjacency = np.asarray(topology, dtype=float).copy()
+    if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
+        raise ValueError("topology must be a square matrix")
+    if np.any(adjacency < 0):
+        raise ValueError("topology weights must be non-negative")
+    if not np.allclose(adjacency, adjacency.T):
+        raise ValueError("Metropolis-Hastings aggregation requires an undirected graph")
+
+    np.fill_diagonal(adjacency, 1.0)
+    degrees = adjacency.sum(axis=1)
+    if np.any(degrees <= 0):
+        raise ValueError("every node must have positive degree after adding self-loops")
+
+    weights = np.zeros_like(adjacency, dtype=float)
+    num_clients = adjacency.shape[0]
+    for client_idx in range(num_clients):
+        for neighbor_idx in range(num_clients):
+            if client_idx != neighbor_idx and adjacency[client_idx, neighbor_idx] > 0:
+                weights[client_idx, neighbor_idx] = 1.0 / max(
+                    degrees[client_idx], degrees[neighbor_idx]
+                )
+        weights[client_idx, client_idx] = 1.0 - weights[client_idx].sum()
+
+    if np.any(weights < -1e-12):
+        raise ValueError("Metropolis-Hastings produced a negative aggregation weight")
+    weights[abs(weights) < 1e-15] = 0.0
+    if not np.allclose(weights.sum(axis=1), 1.0):
+        raise ValueError("Metropolis-Hastings rows must sum to one")
+    if not np.allclose(weights.sum(axis=0), 1.0):
+        raise ValueError("Metropolis-Hastings columns must sum to one")
+    return weights
+
+
 def create_centrality_dict(
     topology: np.array,  # list[list[int]],
     rng: Generator,
@@ -198,11 +238,22 @@ def create_centrality_dict(
     G = nx.from_numpy_array(topology)
 
     centrality_dict = {}
-    for centrality_type in ["degree", "betweenness", "random"]:
+    for centrality_type in [
+        "degree",
+        "betweenness",
+        "closeness",
+        "eigen",
+        "random",
+    ]:
         if centrality_type == "degree":
             cent = nx.degree_centrality(G)
         if centrality_type == "betweenness":
             cent = nx.betweenness_centrality(G, normalized=True, endpoints=True)
+        if centrality_type == "closeness":
+            cent = nx.closeness_centrality(G)
+        if centrality_type == "eigen":
+            # numpy's solver is deterministic for this small symmetric graph.
+            cent = nx.eigenvector_centrality_numpy(G)
         """
         if centrality_type == "cluster":
             cent = nx.degree_centrality(G)
@@ -260,6 +311,12 @@ def create_clients(
     noise_std: float = 0.1,
     noise_mix_ratio: float = 0.1,
     noisy_test_data: Dataset | None = None,
+    noise_value_range: str = "minus_one_one",
+    ood_node_idxs: list[int] | None = None,
+    ood_type: str | None = None,
+    ood_proportion: float = 0.1,
+    ood_severity: int = 3,
+    ood_test_data: Dataset | None = None,
 ) -> list[DecentralClient]:
     """Create many clients with disjoint sets of data.
 
@@ -309,10 +366,10 @@ def create_clients(
     for node_idx in noise_node_idxs:
         if node_idx < 0 or node_idx >= num_clients:
             raise ValueError(f"Invalid noise source client index: {node_idx}")
-        train_subsets[node_idx] = MixedGaussianNoiseDataset(
-            train_subsets[node_idx], noise_mix_ratio, noise_std,
-            node_idx + 1,
-        )
+    ood_node_idxs = ood_node_idxs or []
+    for node_idx in ood_node_idxs:
+        if node_idx < 0 or node_idx >= num_clients:
+            raise ValueError(f"Invalid OOD source client index: {node_idx}")
     label_counts_per_worker = get_label_counts(
         num_clients=len(client_ids),
         num_labels=num_labels,
@@ -331,6 +388,33 @@ def create_clients(
         centrality_metric_data_placement=centrality_metric_data_placement,  # experiment arg
         random_data_placement=random_data_placement,  # experiment arg (MS): default behavior needs to be over turned in the args when making a client
     )
+
+    # Apply noise only after final data placement. Applying it before
+    # place_data_with_node() is ineffective because that function rebuilds all
+    # client Subsets from the clean base dataset.
+    for node_idx in noise_node_idxs:
+        train_subsets[node_idx] = MixedGaussianNoiseDataset(
+            train_subsets[node_idx], noise_mix_ratio, noise_std,
+            node_idx + 1, value_range=noise_value_range,
+        )
+        print(
+            f"gaussian-noise client {node_idx}: ratio={noise_mix_ratio} "
+            f"std={noise_std} value_range={noise_value_range}"
+        )
+
+    for node_idx in ood_node_idxs:
+        train_subsets[node_idx] = CorruptedDataset(
+            train_subsets[node_idx],
+            corruption=ood_type,
+            severity=ood_severity,
+            ratio=ood_proportion,
+            seed=node_idx + 1,
+            value_range=noise_value_range,
+        )
+        print(
+            f"OOD client {node_idx}: type={ood_type} ratio={ood_proportion} "
+            f"severity={ood_severity} value_range={noise_value_range}"
+        )
 
     if backdoor:
         node_idxs = backdoor_node_idxs or [backdoor_node_idx]
@@ -368,7 +452,11 @@ def create_clients(
             neighbor_probs=probs,
             prox_coeff=prox_coeff,
             global_backdoor_test_data=backdoor_test_data,
-            global_noisy_test_data=noisy_test_data,
+            # Kept under the legacy field name for checkpoint compatibility;
+            # it may contain either Gaussian-noise or another OOD test set.
+            global_noisy_test_data=(
+                ood_test_data if ood_test_data is not None else noisy_test_data
+            ),
             # centrality_dict=centrality_dict,
         )
         clients.append(client)
@@ -577,14 +665,23 @@ def centrality_module_avg(
     softmax_coeff = kwargs["softmax_coeff"]
     print(f"{centrality_metric} aggregate round w/ {softmax=}")
 
-    # get weights
-    weights = []
-    for n in neighbor_futures:
-        idx = n[1].idx
-        weights.append(centrality_dict[centrality_metric][idx])
+    # mhCent passes recipient-specific matrix weights. Other centrality methods
+    # continue to derive source weights from the global centrality dictionary.
+    weights = kwargs.get("weights")
+    if weights is not None:
+        weights = [float(weight) for weight in weights]
+        if len(weights) != len(neighbor_futures):
+            raise ValueError("explicit aggregation weights do not match neighborhood")
+        if not np.isclose(sum(weights), 1.0):
+            raise ValueError("explicit aggregation weights must sum to one")
+    else:
+        weights = []
+        for n in neighbor_futures:
+            idx = n[1].idx
+            weights.append(centrality_dict[centrality_metric][idx])
 
     # print(f"pre-normalization {weights=}")
-    if softmax:
+    if kwargs.get("weights") is None and softmax:
         print(f"softmaxing aggregation weights w/ {softmax_coeff=}")
 
         def softmax(x):
@@ -595,7 +692,7 @@ def centrality_module_avg(
         weights = [x * softmax_coeff for x in weights]
         weights = softmax(weights)
 
-    else:
+    elif kwargs.get("weights") is None:
         print("1/N aggregation weights")
         # normalize weights
         weights = [i / sum(weights) for i in weights]

@@ -13,7 +13,6 @@ import glob
 import os
 import json
 import sys
-import shutil
 import hashlib
 import time
 
@@ -26,9 +25,11 @@ from src.decentralized_client import weighted_module_avg
 from src.decentralized_client import test_agg
 from src.decentralized_client import scale_agg
 from src.decentralized_client import update_random_agg_coeffs
+from src.decentralized_client import compute_metropolis_hastings_weights
 from src.modules import create_model
 from src.data import backdoor_data
-from src.data import GaussianNoiseDataset, MixedGaussianNoiseDataset
+from src.data import CorruptedDataset, GaussianNoiseDataset, MixedGaussianNoiseDataset
+from src.data import OOD_CORRUPTIONS
 from src.modules import load_data
 from src.utils import load_checkpoint
 from src.tasks import local_train
@@ -165,9 +166,16 @@ class DecentrallearnApp:
         noise_node_idxs: list[int] | None = None,
         noise_std: float = 0.1,
         noise_mix_ratio: float = 0.1,
+        ood_type: str | None = None,
+        ood_node_idxs: list[int] | None = None,
+        ood_proportion: float = 0.1,
+        ood_severity: int = 3,
     ) -> None:
 
         self.inprocess_execution = os.environ.get("TOPO_FL_INPROCESS", "0") == "1"
+        noise_value_range = (
+            "zero_one" if dataset in {"fmnist", "mnist"} else "minus_one_one"
+        )
         # make the outdir
         args = locals()
         args["topology_path"] = os.path.basename(args["topology_path"])
@@ -309,12 +317,51 @@ class DecentrallearnApp:
         self.noise_node_idxs = list(noise_node_idxs or [])
         self.noise_std = float(noise_std)
         self.noise_mix_ratio = float(noise_mix_ratio)
+        self.noise_value_range = noise_value_range
         if self.noise_node_idxs and not (0.0 <= self.noise_mix_ratio <= 1.0):
             raise ValueError("noise_mix_ratio must be in [0, 1].")
         self.noisy_test_data = (
-            GaussianNoiseDataset(self.test_data, noise_std=self.noise_std, seed=seed or 1)
+            GaussianNoiseDataset(
+                self.test_data,
+                noise_std=self.noise_std,
+                seed=seed or 1,
+                value_range=self.noise_value_range,
+            )
             if self.noise_node_idxs else None
         )
+
+        self.ood_type = ood_type
+        self.ood_node_idxs = list(ood_node_idxs or ([] if ood_type is None else [0]))
+        self.ood_proportion = float(ood_proportion)
+        self.ood_severity = int(ood_severity)
+        self.ood_test_data = None
+        if self.ood_type in {"bd", "backdoor"}:
+            if self.noise_node_idxs:
+                raise ValueError("Backdoor OOD cannot be combined with Gaussian noise nodes")
+            backdoor = True
+            backdoor_proportion = self.ood_proportion
+            backdoor_node_idxs = self.ood_node_idxs
+            self.ood_type = None
+            self.ood_node_idxs = []
+        elif self.ood_type is not None:
+            if self.ood_type not in OOD_CORRUPTIONS:
+                raise ValueError(f"Unsupported OOD type: {self.ood_type}")
+            if backdoor or self.noise_node_idxs:
+                raise ValueError(
+                    "Use either --ood_type, --backdoor, or --noise_node_idxs per run"
+                )
+            if not 0.0 <= self.ood_proportion <= 1.0:
+                raise ValueError("ood_proportion must be in [0, 1]")
+            self.ood_test_data = CorruptedDataset(
+                self.test_data,
+                corruption=self.ood_type,
+                severity=self.ood_severity,
+                ratio=1.0,
+                seed=seed or 1,
+                value_range=self.noise_value_range,
+                cache=True,
+            )
+        self.evaluate_ood = bool(self.noise_node_idxs or self.ood_node_idxs)
 
         self.topology = numpy.loadtxt(topology_path, dtype=float)
         num_clients = self.topology.shape[0]
@@ -340,7 +387,7 @@ class DecentrallearnApp:
                 dataset + "_test",
                 self.test_data,
                 self.test_data.targets,
-                0.1,
+                self.backdoor_proportion,
                 rng_seed,
                 self.rng,
                 self.num_labels,
@@ -358,6 +405,7 @@ class DecentrallearnApp:
 
         self.aggregation_strategy = aggregation_strategy
         self.centrality_metric = None
+        self.aggregation_matrix = None
         self.softmax = softmax
         self.softmax_coeff = softmax_coeff
         self.aggregation_scheduler = BaseScheduler(self.softmax_coeff)
@@ -387,6 +435,18 @@ class DecentrallearnApp:
             self.aggregation_function = centrality_module_avg
         if self.aggregation_strategy == "degCent":
             self.centrality_metric = "degree"
+            self.aggregation_function = centrality_module_avg
+        if self.aggregation_strategy in {"closeCent", "closenessCent"}:
+            self.centrality_metric = "closeness"
+            self.aggregation_function = centrality_module_avg
+        if self.aggregation_strategy == "eigenCent":
+            self.centrality_metric = "eigen"
+            self.aggregation_function = centrality_module_avg
+        if self.aggregation_strategy == "mhCent":
+            self.centrality_metric = "metro_hast"
+            self.aggregation_matrix = compute_metropolis_hastings_weights(
+                self.topology
+            )
             self.aggregation_function = centrality_module_avg
         if self.aggregation_strategy == "weighted":
             self.aggregation_function = weighted_module_avg
@@ -453,6 +513,8 @@ class DecentrallearnApp:
 
         if any(idx < 0 or idx >= num_clients for idx in self.backdoor_node_idxs):
             raise ValueError("Every backdoor node index must be a valid client index.")
+        if any(idx < 0 or idx >= num_clients for idx in self.ood_node_idxs):
+            raise ValueError("Every OOD node index must be a valid client index.")
 
         self.clients = create_clients(
             num_clients,
@@ -483,6 +545,12 @@ class DecentrallearnApp:
             self.noise_std,
             self.noise_mix_ratio,
             self.noisy_test_data,
+            self.noise_value_range,
+            self.ood_node_idxs,
+            self.ood_type,
+            self.ood_proportion,
+            self.ood_severity,
+            self.ood_test_data,
         )
 
         self.centrality_dict = create_centrality_dict(self.topology, self.rng)
@@ -498,12 +566,14 @@ class DecentrallearnApp:
 
         self.client_results: list[Result] = []
 
-        list_of_ckpts = glob.glob(f"{self.run_dir}/*.pth")
-        if list_of_ckpts:
-            # get the latest (most recently saved) ckpt
-            checkpoint_path = max(list_of_ckpts, key=os.path.getctime)
+        list_of_ckpts = sorted(
+            glob.glob(f"{self.run_dir}/*.pth"),
+            key=os.path.getctime,
+            reverse=True,
+        )
+        for checkpoint_path in list_of_ckpts:
             logger.log(
-                APP_LOG_LEVEL, f"Loading lastest checkpoint from:  {checkpoint_path}"
+                APP_LOG_LEVEL, f"Loading checkpoint from: {checkpoint_path}"
             )
             try:
                 (
@@ -514,12 +584,20 @@ class DecentrallearnApp:
                 ) = load_checkpoint(
                     checkpoint_path, self.clients, self.aggregation_scheduler
                 )
-            except:
-                shutil.rmtree(self.run_dir, ignore_errors=False, onerror=None)
-                # 2 error means corrupted ckpt
-                return 2
-            self.start_round += 1  # we save the ckpt after the last round, so we add 1 to start the next round
-            print(f"loaded latest ckpt from: {checkpoint_path}")
+            except Exception as error:
+                quarantine_path = pathlib.Path(
+                    f"{checkpoint_path}.corrupt-{time.time_ns()}"
+                )
+                logger.exception(
+                    "Checkpoint is corrupt; preserving it as %s: %s",
+                    quarantine_path,
+                    error,
+                )
+                os.replace(checkpoint_path, quarantine_path)
+                continue
+            self.start_round += 1
+            print(f"loaded checkpoint from: {checkpoint_path}")
+            break
 
         self._prepare_inprocess_dataset_cache()
 
@@ -597,7 +675,16 @@ class DecentrallearnApp:
                 raw_weights = [1.0] * len(neighbor_idxs)
             denominator = float(sum(raw_weights))
             weights = [float(w) / denominator for w in raw_weights]
-        elif strategy in {"random", "random_betCent", "random_degCent", "betCent", "degCent"}:
+        elif strategy in {
+            "random",
+            "random_betCent",
+            "random_degCent",
+            "betCent",
+            "degCent",
+            "closeCent",
+            "closenessCent",
+            "eigenCent",
+        }:
             raw_weights = [
                 self.centrality_dict[self.centrality_metric][i] for i in neighbor_idxs
             ]
@@ -608,6 +695,13 @@ class DecentrallearnApp:
             else:
                 denominator = float(sum(raw_weights))
                 weights = [float(w) / denominator for w in raw_weights]
+        elif strategy == "mhCent":
+            weights = [
+                float(self.aggregation_matrix[client.idx, neighbor_idx])
+                for neighbor_idx in neighbor_idxs
+            ]
+            if not numpy.isclose(sum(weights), 1.0):
+                raise ValueError("mhCent neighborhood weights must sum to one")
         else:
             raise ValueError(f"in-process aggregation does not support {strategy!r}")
 
@@ -701,7 +795,7 @@ class DecentrallearnApp:
                         self.seed,
                         self.dataset,
                         self.backdoor,
-                        bool(self.noise_node_idxs),
+                        self.evaluate_ood,
                     )
                 else:
                     final_future = evaluator(
@@ -711,7 +805,7 @@ class DecentrallearnApp:
                         self.seed,
                         self.dataset,
                         self.backdoor,
-                        bool(self.noise_node_idxs),
+                        self.evaluate_ood,
                     )
                 train_result_futures.append(final_future)
 
@@ -854,7 +948,8 @@ class DecentrallearnApp:
         snapshot_started = time.perf_counter()
         fast_aggregation = self.inprocess_execution and self.aggregation_strategy in {
             "weighted", "unweighted", "unweighted_fl", "random", "random_betCent",
-            "random_degCent", "betCent", "degCent",
+            "random_degCent", "betCent", "degCent", "closeCent", "closenessCent",
+            "eigenCent", "mhCent",
         }
         snapshot_states = (
             self._snapshot_model_states(self.round_states[round_idx + 1])
@@ -900,6 +995,14 @@ class DecentrallearnApp:
                 self.round_states[round_idx + 1][client.idx].update({"agg": agg_client})
                 futures.append(self._completed_future(agg_client))
                 continue
+            explicit_weights = (
+                [
+                    float(self.aggregation_matrix[client.idx, neighbor_idx])
+                    for neighbor_idx in neighbor_idxs
+                ]
+                if self.aggregation_strategy == "mhCent"
+                else None
+            )
             future = self.aggregation_function(
                 agg_client,
                 self.seed,
@@ -909,6 +1012,7 @@ class DecentrallearnApp:
                 softmax=self.softmax,
                 # softmax_coeff=self.softmax_coeff,
                 softmax_coeff=self.aggregation_scheduler.get_softmax_coeff(),
+                weights=explicit_weights,
             )
             futures.append(future)
             self.round_states[round_idx + 1][client.idx].update({"agg": future})

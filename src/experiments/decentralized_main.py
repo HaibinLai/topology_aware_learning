@@ -166,6 +166,10 @@ if __name__ == "__main__":
             "scale_agg",
             "degCent",
             "betCent",
+            "closeCent",
+            "closenessCent",
+            "eigenCent",
+            "mhCent",
             "degCent_sim",
             "betCent_sim",
             # "degCent_CA",
@@ -235,9 +239,52 @@ if __name__ == "__main__":
     parser.add_argument("--noise_node_idxs", type=int, nargs="+", default=None,
                         help="Client IDs receiving label-preserving Gaussian input noise.")
     parser.add_argument("--noise_std", type=float, default=0.1,
-                        help="Gaussian noise standard deviation on CIFAR-10 [0,1] pixels.")
+                        help="Gaussian noise standard deviation on the original [0,1] pixel scale.")
     parser.add_argument("--noise_mix_ratio", type=float, default=0.1,
                         help="Fraction of each selected client's training samples corrupted.")
+    parser.add_argument(
+        "--ood_type",
+        type=str,
+        default=None,
+        choices=[
+            "bd",
+            "backdoor",
+            "noise",
+            "impulse_noise",
+            "gaussian_noise",
+            "blur",
+            "defocus",
+            "weather",
+            "brightness",
+            "contrast",
+            "pixelate",
+        ],
+        help=(
+            "Unified upstream-compatible OOD mode. Use bd/backdoor for a trigger "
+            "attack; image corruptions preserve labels."
+        ),
+    )
+    parser.add_argument(
+        "--ood_node_idxs",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Client indices receiving OOD data; defaults to client 0 when OOD is enabled.",
+    )
+    parser.add_argument(
+        "--ood_proportion",
+        type=float,
+        default=0.1,
+        help="Fraction of each selected client's local training set converted to OOD data.",
+    )
+    parser.add_argument(
+        "--ood_severity",
+        type=int,
+        choices=range(1, 6),
+        default=3,
+        metavar="[1-5]",
+        help="Corruption severity for non-backdoor OOD modes.",
+    )
     parser.add_argument(
         "--backdoor_proportion",
         type=float,
@@ -464,6 +511,10 @@ if __name__ == "__main__":
             noise_node_idxs=args.noise_node_idxs,
             noise_std=args.noise_std,
             noise_mix_ratio=args.noise_mix_ratio,
+            ood_type=args.ood_type,
+            ood_node_idxs=args.ood_node_idxs,
+            ood_proportion=args.ood_proportion,
+            ood_severity=args.ood_severity,
             num_test=args.num_test,  # TinyMem number of test data per task
             num_example=args.num_example,  # TinyMem total number of data per task (train + test)
             modulo=args.modulo,  # TinyMem modulo applied to each # in seq

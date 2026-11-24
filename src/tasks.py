@@ -4,7 +4,7 @@ import sys
 import time
 import os
 from torch import nn
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from datetime import datetime
 from sklearn.metrics import classification_report, roc_auc_score
 import torch
@@ -534,6 +534,7 @@ def evaluate_final_client_impl(
         result.update({
             "ood_acc": noisy_result["test_acc"],
             "ood_auc_macro": noisy_result["clean_auc_macro"],
+            "ood_auc_weighted": noisy_result["clean_auc_weighted"],
         })
     result.update(
         {
@@ -562,6 +563,12 @@ def test_model(
     dataset: DataChoices = None,
 ) -> Result:
     """Evaluate a model."""
+
+    # Test-only escape hatch for fast integration smoke tests.  Formal runs do
+    # not set this variable and therefore always evaluate the complete set.
+    eval_limit = int(os.environ.get("TOPO_FL_EVAL_LIMIT", "0"))
+    if eval_limit > 0 and len(data) > eval_limit:
+        data = Subset(data, range(eval_limit))
 
     # NOTE(MS): assign device once task has been fired off, rather than before via a function arg
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

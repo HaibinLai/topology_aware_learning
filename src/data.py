@@ -8,8 +8,10 @@ import math
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
 import torch
+import torch.nn.functional as F
 import os
 import hashlib
+import threading
 
 from src.modules import load_data
 from src.modules import CustomLMDataset
@@ -26,20 +28,199 @@ Generic type variable used throughout Flight.
 """
 FloatTriple: t.TypeAlias = tuple[float, float, float]
 
+OOD_CORRUPTIONS = {
+    "noise",
+    "impulse_noise",
+    "gaussian_noise",
+    "blur",
+    "defocus",
+    "weather",
+    "brightness",
+    "contrast",
+    "pixelate",
+}
+
+
+def _to_zero_one(x: torch.Tensor, value_range: str) -> torch.Tensor:
+    if value_range == "zero_one":
+        return x.clamp(0.0, 1.0)
+    if value_range == "minus_one_one":
+        return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
+    raise ValueError("value_range must be either 'zero_one' or 'minus_one_one'")
+
+
+def _from_zero_one(x: torch.Tensor, value_range: str) -> torch.Tensor:
+    x = x.clamp(0.0, 1.0)
+    return x if value_range == "zero_one" else (x - 0.5) / 0.5
+
+
+def apply_ood_corruption(
+    x: torch.Tensor,
+    corruption: str,
+    severity: int,
+    generator: torch.Generator,
+    value_range: str,
+) -> torch.Tensor:
+    """Apply a deterministic image corruption without optional CV packages.
+
+    The interface follows the upstream ``aurora`` OOD choices.  Corruption is
+    performed on the original [0, 1] pixel scale and converted back to the
+    transform range used by the selected dataset.
+    """
+    if corruption not in OOD_CORRUPTIONS:
+        raise ValueError(f"Unsupported OOD corruption: {corruption}")
+    if severity not in range(1, 6):
+        raise ValueError("OOD severity must be an integer from 1 to 5")
+
+    original_dtype = x.dtype
+    raw = _to_zero_one(x.float(), value_range)
+    canonical = "impulse_noise" if corruption == "noise" else corruption
+
+    if canonical == "impulse_noise":
+        amount = [0.01, 0.02, 0.03, 0.05, 0.07][severity - 1]
+        mask = torch.rand(raw.shape, generator=generator, dtype=raw.dtype)
+        raw = torch.where(mask < amount / 2, torch.zeros_like(raw), raw)
+        raw = torch.where(mask > 1.0 - amount / 2, torch.ones_like(raw), raw)
+    elif canonical == "gaussian_noise":
+        std = [0.04, 0.06, 0.08, 0.10, 0.12][severity - 1]
+        raw = raw + torch.randn(raw.shape, generator=generator, dtype=raw.dtype) * std
+    elif canonical in {"blur", "defocus"}:
+        kernel = [3, 3, 5, 5, 7][severity - 1]
+        passes = 2 if canonical == "blur" and severity >= 4 else 1
+        batched = raw.unsqueeze(0)
+        for _ in range(passes):
+            batched = F.avg_pool2d(batched, kernel, stride=1, padding=kernel // 2)
+        raw = batched.squeeze(0)
+    elif canonical == "brightness":
+        raw = raw + [0.05, 0.10, 0.15, 0.20, 0.30][severity - 1]
+    elif canonical == "contrast":
+        scale = [0.75, 0.50, 0.40, 0.30, 0.15][severity - 1]
+        mean = raw.mean(dim=(-2, -1), keepdim=True)
+        raw = (raw - mean) * scale + mean
+    elif canonical == "pixelate":
+        scale = [0.95, 0.90, 0.85, 0.75, 0.65][severity - 1]
+        height, width = raw.shape[-2:]
+        small = F.interpolate(
+            raw.unsqueeze(0),
+            size=(max(1, int(height * scale)), max(1, int(width * scale))),
+            mode="area",
+        )
+        raw = F.interpolate(small, size=(height, width), mode="nearest").squeeze(0)
+    elif canonical == "weather":
+        strength = [0.25, 0.40, 0.55, 0.70, 0.85][severity - 1]
+        haze = torch.rand((1, *raw.shape[-2:]), generator=generator, dtype=raw.dtype)
+        kernel = min(9, max(3, 2 * (severity + 1) + 1))
+        haze = F.avg_pool2d(
+            haze.unsqueeze(0), kernel, stride=1, padding=kernel // 2
+        ).squeeze(0)
+        raw = raw * (1.0 - 0.35 * strength) + haze * strength
+
+    return _from_zero_one(raw, value_range).to(original_dtype)
+
+
+class CorruptedDataset(Dataset):
+    """Deterministically corrupt a fixed fraction of an image dataset."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        corruption: str,
+        severity: int = 3,
+        ratio: float = 1.0,
+        seed: int = 1,
+        value_range: str = "minus_one_one",
+        cache: bool = False,
+    ):
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError("OOD corruption ratio must be in [0, 1]")
+        if corruption not in OOD_CORRUPTIONS:
+            raise ValueError(f"Unsupported OOD corruption: {corruption}")
+        if severity not in range(1, 6):
+            raise ValueError("OOD severity must be an integer from 1 to 5")
+        if value_range not in {"zero_one", "minus_one_one"}:
+            raise ValueError(
+                "value_range must be either 'zero_one' or 'minus_one_one'"
+            )
+
+        self.dataset = dataset
+        self.corruption = corruption
+        self.severity = int(severity)
+        self.seed = int(seed)
+        self.value_range = value_range
+        self.cache = bool(cache)
+        self._cache: dict[int, tuple[torch.Tensor, t.Any]] = {}
+        self._cache_lock = threading.Lock()
+        rng = np.random.default_rng(self.seed)
+        count = int(round(len(dataset) * ratio))
+        self.corrupted_indices = set(rng.permutation(len(dataset))[:count].tolist())
+
+    def __getstate__(self):
+        """Keep the wrapper serializable for Parsl worker processes."""
+        state = self.__dict__.copy()
+        state.pop("_cache_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._cache_lock = threading.Lock()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        x, y = self.dataset[index]
+        if index not in self.corrupted_indices:
+            return x, y
+
+        def corrupt():
+            digest = hashlib.blake2b(
+                f"{self.seed}:{self.corruption}:{self.severity}:{index}".encode(),
+                digest_size=8,
+            ).digest()
+            generator = torch.Generator().manual_seed(
+                int.from_bytes(digest, "little") % (2**63 - 1)
+            )
+            return (
+                apply_ood_corruption(
+                    x, self.corruption, self.severity, generator, self.value_range
+                ),
+                y,
+            )
+
+        if not self.cache:
+            return corrupt()
+        with self._cache_lock:
+            if index not in self._cache:
+                self._cache[index] = corrupt()
+            return self._cache[index]
+
+
+def _add_gaussian_noise(x, noise_std: float, generator, value_range: str):
+    """Add clipped Gaussian noise while preserving the dataset's tensor range."""
+    raw = _to_zero_one(x, value_range)
+
+    raw = (
+        raw
+        + torch.randn(raw.shape, generator=generator, dtype=raw.dtype) * noise_std
+    ).clamp(0.0, 1.0)
+    return _from_zero_one(raw, value_range)
+
 
 class GaussianNoiseDataset(Dataset):
-    """Deterministic, label-preserving Gaussian corruption for CIFAR-10 tensors.
-
-    CIFAR-10 tensors in this project are normalized with mean/std 0.5. Noise is
-    sampled on the original [0, 1] pixel scale, clipped, and normalized again.
-    """
+    """Deterministic, label-preserving Gaussian corruption on the pixel scale."""
 
     def __init__(self, dataset: Dataset, indices: list[int] | None = None,
-                 noise_std: float = 0.1, seed: int = 1):
+                 noise_std: float = 0.1, seed: int = 1,
+                 value_range: str = "minus_one_one"):
         self.dataset = dataset
         self.indices = list(range(len(dataset))) if indices is None else list(indices)
         self.noise_std = float(noise_std)
         self.seed = int(seed)
+        if value_range not in {"zero_one", "minus_one_one"}:
+            raise ValueError(
+                "value_range must be either 'zero_one' or 'minus_one_one'"
+            )
+        self.value_range = value_range
 
     def __len__(self):
         return len(self.indices)
@@ -50,21 +231,27 @@ class GaussianNoiseDataset(Dataset):
         # Stable per-example noise: repeated epochs see the same corrupted image.
         digest = hashlib.blake2b(f"{self.seed}:{self.indices[index]}".encode(), digest_size=8).digest()
         generator = torch.Generator().manual_seed(int.from_bytes(digest, "little") % (2**63 - 1))
-        raw = ((x + 1.0) * 0.5).clamp(0.0, 1.0)
-        raw = (raw + torch.randn(raw.shape, generator=generator, dtype=raw.dtype) * self.noise_std).clamp(0.0, 1.0)
-        return (raw - 0.5) / 0.5, y
+        return _add_gaussian_noise(
+            x, self.noise_std, generator, self.value_range
+        ), y
 
 
 class MixedGaussianNoiseDataset(Dataset):
     """Apply fixed-seed input noise to a selected fraction of a local subset."""
 
-    def __init__(self, dataset: Dataset, ratio: float, noise_std: float, seed: int):
+    def __init__(self, dataset: Dataset, ratio: float, noise_std: float, seed: int,
+                 value_range: str = "minus_one_one"):
         self.dataset = dataset
         n_noisy = int(round(len(dataset) * ratio))
         rng = np.random.default_rng(seed)
         self.noisy_indices = set(rng.permutation(len(dataset))[:n_noisy].tolist())
         self.noise_std = noise_std
         self.seed = seed
+        if value_range not in {"zero_one", "minus_one_one"}:
+            raise ValueError(
+                "value_range must be either 'zero_one' or 'minus_one_one'"
+            )
+        self.value_range = value_range
 
     def __len__(self):
         return len(self.dataset)
@@ -74,9 +261,9 @@ class MixedGaussianNoiseDataset(Dataset):
         if index in self.noisy_indices:
             import torch
             generator = torch.Generator().manual_seed((self.seed * 1000003 + index) % (2**63 - 1))
-            raw = ((x + 1.0) * 0.5).clamp(0.0, 1.0)
-            raw = (raw + torch.randn(raw.shape, generator=generator, dtype=raw.dtype) * self.noise_std).clamp(0.0, 1.0)
-            x = (raw - 0.5) / 0.5
+            x = _add_gaussian_noise(
+                x, self.noise_std, generator, self.value_range
+            )
         return x, y
 
 

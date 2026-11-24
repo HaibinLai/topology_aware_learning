@@ -4,6 +4,8 @@ import torch
 import pandas as pd
 import logging
 from typing import Optional
+import os
+import tempfile
 
 from src.types import Result
 from src.decentralized_client import DecentralClient
@@ -34,7 +36,25 @@ def save_checkpoint(
         "client_results": client_results,
     }
 
-    torch.save(ckpt, ckpt_path)
+    destination = pathlib.Path(ckpt_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write beside the final file, validate it, then atomically publish it.
+    # This prevents a killed worker or transient filesystem error from leaving
+    # a truncated file that is later mistaken for a resumable checkpoint.
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(fd)
+    temporary_path = pathlib.Path(temporary_name)
+    try:
+        torch.save(ckpt, temporary_path)
+        if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+            raise IOError(f"Checkpoint was not written correctly: {temporary_path}")
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
     print(f"Saved checkpoint for round: {round_idx}")
 
     return
@@ -100,8 +120,28 @@ def process_futures_and_ckpt(
             client = client_future["agg"].result()[1]
         ckpt_clients.append(client)
     # NOTE (MS): we only train until N-1 round so name ckpt accordingly
-    checkpoint_path = f"{run_dir}/{rounds-1}_ckpt.pth"
-    save_checkpoint(rounds - 1, ckpt_clients, client_results, checkpoint_path)
+    checkpoint_path = pathlib.Path(run_dir) / f"{rounds-1}_ckpt.pth"
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            save_checkpoint(rounds - 1, ckpt_clients, client_results, checkpoint_path)
+            if checkpoint_path.stat().st_size == 0:
+                raise IOError(f"Empty checkpoint: {checkpoint_path}")
+            break
+        except (OSError, RuntimeError):
+            if attempt == max_retries:
+                logging.exception(
+                    "Failed to save checkpoint after %d attempts: %s",
+                    max_retries,
+                    checkpoint_path,
+                )
+                raise
+            logging.exception(
+                "Checkpoint attempt %d/%d failed; retrying: %s",
+                attempt,
+                max_retries,
+                checkpoint_path,
+            )
 
     # Keep metrics in the checkpoint/in-memory list during intermediate
     # checkpoints.  CSV serialization is relatively expensive and needlessly

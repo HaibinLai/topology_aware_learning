@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title desc">
+  <title id="title">Aurora selective migration architecture</title>
+  <desc id="desc">Features selected from aurora_mvp and aurora flow into the local optimized base while preserving existing metrics and acceleration.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#46637f"/>
+    </marker>
+    <style>
+      .title { font: 700 30px sans-serif; fill: #13233a; }
+      .heading { font: 700 20px sans-serif; fill: #13233a; }
+      .body { font: 16px sans-serif; fill: #24364b; }
+      .small { font: 14px sans-serif; fill: #42566e; }
+      .source { fill: #edf4ff; stroke: #5680b3; stroke-width: 2; }
+      .base { fill: #edf9f1; stroke: #4f9568; stroke-width: 2; }
+      .target { fill: #fff7df; stroke: #bd8a22; stroke-width: 3; }
+      .preserve { fill: #f7efff; stroke: #8057ad; stroke-width: 2; }
+      .arrow { stroke: #46637f; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1200" height="650" fill="#fbfcfe"/>
+  <text x="600" y="48" text-anchor="middle" class="title">Aurora Selective Migration</text>
+
+  <rect x="45" y="100" width="315" height="170" rx="18" class="source"/>
+  <text x="202" y="137" text-anchor="middle" class="heading">aurora_mvp</text>
+  <text x="70" y="172" class="body">• One-indexed Aurora CPU affinity</text>
+  <text x="70" y="203" class="body">• TMPDIR and worker stability</text>
+  <text x="70" y="234" class="body">• Checkpoint failure handling</text>
+
+  <rect x="45" y="355" width="315" height="205" rx="18" class="source"/>
+  <text x="202" y="392" text-anchor="middle" class="heading">aurora</text>
+  <text x="70" y="427" class="body">• Metropolis-Hastings aggregation</text>
+  <text x="70" y="458" class="body">• OOD interfaces and placement</text>
+  <text x="70" y="489" class="body">• Multi-node attacks</text>
+  <text x="70" y="520" class="body">• Closeness/eigen centralities</text>
+
+  <rect x="440" y="170" width="320" height="320" rx="22" class="base"/>
+  <text x="600" y="212" text-anchor="middle" class="heading">Local optimized base</text>
+  <text x="470" y="252" class="body">Preserved:</text>
+  <text x="485" y="284" class="body">• In-process fast training</text>
+  <text x="485" y="315" class="body">• Dynamic combined random</text>
+  <text x="485" y="346" class="body">• Clean/backdoor/OOD AUC</text>
+  <text x="485" y="377" class="body">• SSD logs and Parsl runinfo</text>
+  <text x="485" y="408" class="body">• Gaussian-noise experiments</text>
+  <text x="485" y="454" class="small">No whole-branch overwrite</text>
+
+  <rect x="840" y="170" width="315" height="320" rx="22" class="target"/>
+  <text x="997" y="212" text-anchor="middle" class="heading">Integrated code</text>
+  <text x="870" y="252" class="body">• Stable checkpoints</text>
+  <text x="870" y="283" class="body">• MH / closeness / eigen</text>
+  <text x="870" y="314" class="body">• Deterministic OOD</text>
+  <text x="870" y="345" class="body">• Multiple attack nodes</text>
+  <text x="870" y="376" class="body">• Fast OOD test cache</text>
+  <text x="870" y="420" class="small">8/8 unit tests passed</text>
+  <text x="870" y="447" class="small">33-client smoke passed</text>
+
+  <path d="M360 185 C405 185, 405 230, 440 230" class="arrow"/>
+  <path d="M360 457 C405 457, 405 410, 440 410" class="arrow"/>
+  <path d="M760 330 L840 330" class="arrow"/>
+
+  <rect x="440" y="550" width="715" height="62" rx="15" class="preserve"/>
+  <text x="797" y="578" text-anchor="middle" class="heading">Compatibility rule</text>
+  <text x="797" y="600" text-anchor="middle" class="small">Migrate verified features; preserve local semantics, speed, metrics, and storage routing.</text>
+</svg>
