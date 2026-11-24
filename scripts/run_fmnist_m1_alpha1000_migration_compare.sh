@@ -4,7 +4,7 @@ set -uo pipefail
 
 repo_dir="/home/haibin/topo_fl/topology_aware_learning"
 python_bin="/ssd/haibin/miniconda3/envs/topo/bin/python"
-output_root="/ssd/haibin/logs/topology_aware_learning_fmnist_m1_migration_compare_20261124"
+output_root="${OUTPUT_ROOT:-/ssd/haibin/logs/topology_aware_learning_fmnist_m1_migration_compare_20261124}"
 results_dir="${output_root}/results"
 stdout_dir="${output_root}/stdout"
 status_log="${output_root}/queue.log"
