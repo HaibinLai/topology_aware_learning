@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -248,6 +249,12 @@ def main() -> None:
             "topology_aware_learning_fmnist_additional_ba_m3_20261124"
         ),
     )
+    parser.add_argument(
+        "--publish-dir",
+        type=Path,
+        default=None,
+        help="Optional repository directory for report, CSVs, and comparison plot.",
+    )
     args = parser.parse_args()
     summary, clients = load_runs(args.root)
     summary = summary.sort_values(["condition", "label_alpha", "aggregation_arg"])
@@ -272,6 +279,7 @@ Updated: 2026-11-24
 - Noise: impulse noise, severity 5, proportion 0.1
 - Noise nodes: 23, 27, 28, 30
 - Values are means over 33 client records at final round 39
+- Raw output root: `{args.root}`
 
 ## No-OOD additions
 
@@ -304,7 +312,18 @@ Updated: 2026-11-24
 - `results/`: raw CSVs, arguments, logs, and checkpoints.
 - `queue.log`: start/completion status and runtimes.
 """
-    (args.root / "FINAL_RESULTS.md").write_text(report)
+    report_path = args.root / "FINAL_RESULTS.md"
+    report_path.write_text(report)
+
+    if args.publish_dir is not None:
+        args.publish_dir.mkdir(parents=True, exist_ok=True)
+        for filename in (
+            "FINAL_RESULTS.md",
+            "final_summary.csv",
+            "per_client_results.csv",
+            "final_results.png",
+        ):
+            shutil.copy2(args.root / filename, args.publish_dir / filename)
 
 
 if __name__ == "__main__":
